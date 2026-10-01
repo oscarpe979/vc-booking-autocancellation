@@ -1,0 +1,99 @@
+{
+  "manifestVersion": 1,
+  "displayName": "Enterprise Booking Autocancellation Service",
+  "vendor": "Enterprise Collaboration Engineering",
+  "email": "collab-admin@enterprise.com",
+  "description": "Centralized, vendor-agnostic booking autocancellation and occupancy release service for meeting rooms.",
+  "availability": "org_private",
+  "apiAccess": [
+    {
+      "scope": "spark-admin:devices_read",
+      "access": "required",
+      "role": "id_readonly_admin"
+    },
+    {
+      "scope": "spark-admin:workspaces_read",
+      "access": "required",
+      "role": "id_readonly_admin"
+    },
+    {
+      "scope": "spark:xapi_statuses",
+      "access": "required"
+    },
+    {
+      "scope": "spark:xapi_commands",
+      "access": "required"
+    }
+  ],
+  "xapiAccess": {
+    "status": [
+      {
+        "path": "RoomAnalytics.RoomInUse",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.Availability",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.Current.Id",
+        "access": "required"
+      },
+      {
+        "path": "Peripherals.ConnectedDevice",
+        "access": "required"
+      },
+      {
+        "path": "SystemUnit.ProductPlatform",
+        "access": "required"
+      },
+      {
+        "path": "Time.SystemTime",
+        "access": "required"
+      }
+    ],
+    "commands": [
+      {
+        "path": "UserInterface.Message.Prompt.Display",
+        "access": "required"
+      },
+      {
+        "path": "UserInterface.Message.Prompt.Clear",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.CheckIn",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.CheckOut",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.Get",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.List",
+        "access": "required"
+      }
+    ],
+    "events": [
+      {
+        "path": "UserInterface.Message.Prompt.Response",
+        "access": "required"
+      },
+      {
+        "path": "UserInterface.Message.Prompt.Cleared",
+        "access": "required"
+      },
+      {
+        "path": "Bookings.CheckedIn",
+        "access": "required"
+      }
+    ]
+  },
+  "provisioning": {
+    "type": "manual"
+  }
+}
