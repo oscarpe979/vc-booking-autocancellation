@@ -43,6 +43,8 @@ Otherwise: preserve the booking and take no action.
 
 The service is structured according to Hexagonal Architecture (Ports and Adapters). Core booking autocancellation workflow logic has zero coupling to Cisco xAPI, Webex SDKs, or cloud network protocols.
 
+For the comprehensive visual Domain-Driven Design (DDD) architecture model detailing Aggregate Roots, Domain Policies, Safety Guards, and mutable configuration bindings, see [service/docs/ServiceDomainDrivenDesign.md](service/docs/ServiceDomainDrivenDesign.md).
+
 ```
 +----------------------------------------------------------------------------------------------------+
 |                                      INGRESS TRANSPORT LAYER                                       |
@@ -80,7 +82,7 @@ The service is structured according to Hexagonal Architecture (Ports and Adapter
 |                     +------------------+------------------+------------------+                    |
 |                     |                  |                  |                  |                    |
 |                     v                  v                  v                  v                    |
-|            IRoomPresenceDriver  IRoomInteraction  ICalendarConnector  INotificationDriver         |
+|            IRoomPresenceDriver  IRoomInteraction  ICalendarDriver     INotificationDriver         |
 |            (Occupancy)          (In-Room UI)      (Bookings/CheckIn)  (Email Notifications)       |
 |                     |                  |                  |                  |                    |
 +---------------------|------------------|------------------|------------------|--------------------+
@@ -107,7 +109,7 @@ The service is structured according to Hexagonal Architecture (Ports and Adapter
 |                                                                                                    |
 |     +-----------------------------------------------------------------------------------------+    |
 |     |                      Future Adapters (Pluggable Hardware Modules)                       |    |
-|     |     * Poly / Neat Presence Driver       * Microsoft Graph Direct Calendar Connector      |    |
+|     |     * Poly / Neat Presence Driver       * Microsoft Graph Direct Calendar Driver         |    |
 |     +-----------------------------------------------------------------------------------------+    |
 +----------------------------------------------------------------------------------------------------+
 ```
@@ -138,7 +140,7 @@ Abstracts user prompts, warnings, audio chimes, and touch responses:
 - `onPromptResponse(handler: (event: PromptResponseEvent) => void): void`: Ingests user selections (`OptionId: '1'` or `'2'`).
 - `onPromptCleared(handler: (event: PromptClearedEvent) => void): void`: Ingests prompt dismissal events.
 
-### 4.3 Calendar Connector (`ICalendarConnector`)
+### 4.3 Calendar Driver (`ICalendarDriver`)
 Abstracts meeting reservation metadata and release execution:
 - `getAvailability(roomId: string): Promise<RoomAvailabilitySnapshot>`: Returns `Free`, `FreeUntil`, or `BookedUntil` with timestamps.
 - `getBookingDetails(roomId: string, bookingId: string): Promise<BookingDetails>`: Queries `Bookings.Get({ Id })` with fallback to `Bookings.List({ ScheduleType: 'Current', Limit: 1 })`. Includes `BookedFromDevice` flag, organizer email/name, meeting title, start/end timestamps.

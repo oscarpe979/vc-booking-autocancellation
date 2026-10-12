@@ -6,7 +6,7 @@ Engineers need to build, run, test, and validate the external Booking Auto Cance
 
 Before deploying to AWS, the team must prove that:
 1. The core autocancellation state machine accurately ports the validated codec-native logic.
-2. The Hexagonal driver abstractions (`IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarConnector`) properly decouple domain rules from device SDKs.
+2. The Hexagonal driver abstractions (`IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarDriver`) properly decouple domain rules from device SDKs.
 3. The service can ingest live device telemetry via outbound long-polling using Webex Workspace Integrations.
 4. The Startup Check-In Quarantine and Just-In-Time (JIT) pre-checkout probe work reliably in real-time execution.
 
@@ -34,7 +34,7 @@ Sprint 1 delivers:
 1. As a software engineer, I want a TypeScript project structure with build and test scripts, so that I can compile, run, and test the service locally.
 2. As a software engineer, I want the service configuration loaded from environment variables and `.env.local`, so that I can configure timeouts, grace periods, Webex credentials, and SMTP settings easily on my laptop.
 3. As a software engineer, I want the core room state machine to manage meeting lifecycles in memory, so that rooms transition accurately between Idle, Quarantined, CountdownScheduled, PromptVisible, and Released states.
-4. As a software engineer, I want the domain logic isolated behind driver interfaces (`IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarConnector`, `IDeviceConfigDriver`, `INotificationDriver`), so that the core engine has zero direct dependencies on Cisco xAPI or specific mail transports.
+4. As a software engineer, I want the domain logic isolated behind driver interfaces (`IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarDriver`, `IDeviceConfigDriver`, `INotificationDriver`), so that the core engine has zero direct dependencies on Cisco xAPI or specific mail transports.
 5. As a software engineer, I want a Webex adapter implementing the driver interfaces via `workspace-integrations`, so that the service can communicate with real Cisco codecs.
 6. As a software engineer working on a corporate laptop, I want the service to ingest Webex events via outbound long-polling, so that I can receive live room events without opening inbound ports or running tunneling tools.
 7. As a software engineer, I want an in-memory room registry, so that multiple rooms can be simulated or managed concurrently during local testing.
@@ -86,7 +86,7 @@ Sprint 1 delivers:
 Define the driver contracts in domain types:
 - `IRoomPresenceDriver`: `getPresence(roomId)`, `onPresenceChange(handler)`.
 - `IRoomInteractionDriver`: `hasActionableSurface(roomId)`, `displayWarning(roomId, prompt)`, `displayConfirmation(roomId, prompt)`, `clearWarning(roomId, promptId)`, `restoreDismissedPrompt(roomId, prompt)`, `playAudioAlert(roomId, alert)`, `restoreAudioVolume(roomId)`, `onPromptResponse(handler)`, `onPromptCleared(handler)`.
-- `ICalendarConnector`: `getAvailability(roomId)`, `getBookingDetails(roomId, bookingId)`, `checkIn(roomId, bookingId, trackingData)`, `checkOut(roomId, bookingId, reason)`, `onCheckedIn(handler)`.
+- `ICalendarDriver`: `getAvailability(roomId)`, `getBookingDetails(roomId, bookingId)`, `checkIn(roomId, bookingId, trackingData)`, `checkOut(roomId, bookingId, reason)`, `onCheckedIn(handler)`.
 - `IDeviceConfigDriver`: `enforceBaselinePresenceConfig(roomId)`, `enforceNativeCheckInWindow(roomId, windowMinutes)`, `setNativeCheckInEnabled(roomId, enabled)`.
 - `INotificationDriver`: `sendCancellationWarning(payload)`, `sendCancellationNotice(payload)`.
 - `IEventIngressTransport`: `start()`, `stop()`, `onNotification(handler)`.
@@ -145,7 +145,7 @@ Define the driver contracts in domain types:
 
 ### 1. Unit Testing with Mock Drivers
 - Use Vitest with fake timers (`vi.useFakeTimers()`).
-- Create `MockPresenceDriver`, `MockInteractionDriver`, `MockCalendarConnector`, `MockDeviceConfigDriver`, and `MockNotificationDriver`.
+- Create `MockPresenceDriver`, `MockInteractionDriver`, `MockCalendarDriver`, `MockDeviceConfigDriver`, and `MockNotificationDriver`.
 - Test scenarios:
   1. Standard No-Show Release (empty room $\to$ countdown $\to$ prompt display $\to$ warning email dispatched $\to$ timeout $\to$ JIT check $\to$ checkout $\to$ cancellation email dispatched).
   2. Prompt Response "Keep Booking" (cancels warning, resets countdown, no duplicate warning email sent on later prompt restoration).
@@ -184,7 +184,7 @@ The following vertical slices represent the implementation tickets for Sprint 1 
 - **TICKET-01: Core Scaffolding & End-to-End Tracer Bullet** (`01-core-scaffolding-tracer-bullet.md`)
   - Initialize `service` folder with `package.json`, `tsconfig.json`, Vitest, and linter.
   - Implement strongly typed configuration loader reading `.env.local` and environment variables.
-  - Define domain interfaces: `IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarConnector`, `IDeviceConfigDriver`, `INotificationDriver`, `IEventIngressTransport`.
+  - Define domain interfaces: `IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarDriver`, `IDeviceConfigDriver`, `INotificationDriver`, `IEventIngressTransport`.
   - Implement in-memory room registry and prove end-to-end idle-to-active monitoring tracer bullet.
 
 - **TICKET-02: No-Show Release Workflow & Just-In-Time Verification Probe** (`02-no-show-release-jit-verification.md`)

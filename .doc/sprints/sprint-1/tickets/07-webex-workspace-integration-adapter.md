@@ -1,6 +1,6 @@
 # 07: Webex Workspace Integration Driver Adapter
 
-**What to build:** An engineer can bind the domain engine to real Cisco collaboration devices using Webex Workspace Integrations. The adapter fulfills the Hexagonal contracts (IRoomPresenceDriver, IRoomInteractionDriver, ICalendarConnector, and IDeviceConfigDriver) via the official Webex SDK, translating xStatus queries, xCommands, xConfigs, and xEvents to and from domain representations, enforcing device baseline configurations, and serializing native check-in toggles.
+**What to build:** An engineer can bind the domain engine to real Cisco collaboration devices using Webex Workspace Integrations. The adapter fulfills the Hexagonal contracts (IRoomPresenceDriver, IRoomInteractionDriver, ICalendarDriver, and IDeviceConfigDriver) via the official Webex SDK, translating xStatus queries, xCommands, xConfigs, and xEvents to and from domain representations, enforcing device baseline configurations, and serializing native check-in toggles.
 
 **Blocked by:** 01: Core Scaffolding & End-to-End Tracer Bullet
 

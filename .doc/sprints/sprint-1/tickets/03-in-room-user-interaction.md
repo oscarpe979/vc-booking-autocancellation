@@ -16,7 +16,7 @@
 - [ ] When the warning prompt is visible on an actionable surface, a user response of "Keep Booking" clears the prompt and cancels the active release workflow
 - [ ] After "Keep Booking" is received, a fresh countdown will only begin if the room subsequently remains continuously vacant
 - [ ] A user response of "Check Out" on the warning prompt displays a distinct checkout confirmation prompt rather than releasing immediately
-- [ ] Confirming checkout on the confirmation prompt issues an immediate checkout command to the calendar connector (manual user checkouts do not dispatch cancellation email receipts)
+- [ ] Confirming checkout on the confirmation prompt issues an immediate checkout command to the calendar driver (manual user checkouts do not dispatch cancellation email receipts)
 - [ ] Dismissing, ignoring, or canceling the confirmation prompt preserves the booking
 - [ ] Stale prompt responses from older booking lifecycles or cancelled workflows are safely ignored
 - [ ] Automated tests verify audio alerts, prompt restoration, warning email dispatch and deduplication, "Keep Booking", and the two-step "Check Out" interaction paths using mock drivers

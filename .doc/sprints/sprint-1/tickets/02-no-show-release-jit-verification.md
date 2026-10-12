@@ -13,8 +13,8 @@
 - [ ] At the configured warning threshold prior to release, the service requests an actionable warning prompt through the interaction driver and initiates warning email dispatch to the organizer
 - [ ] At the expiration of the empty-room timeout and grace period, the service executes a synchronous Just-In-Time probe querying instantaneous presence and availability
 - [ ] Fail-closed safety check: if the warning email failed to send to the organizer after bounded retries, the checkout command is aborted and the booking preserved
-- [ ] If the Just-In-Time probe confirms the room is still empty and the booking ID matches the active lifecycle, a checkout command is sent to the calendar connector
+- [ ] If the Just-In-Time probe confirms the room is still empty and the booking ID matches the active lifecycle, a checkout command is sent to the calendar driver
 - [ ] Upon successful calendar release, a cancellation notice email (No-Show template) is dispatched to the meeting organizer via the notification driver
 - [ ] If the Just-In-Time probe detects occupancy, an unknown presence state, or an altered booking identity, the checkout command is suppressed and the booking is preserved
-- [ ] In dry-run mode, the full countdown, warning, email simulation, and verification sequence executes and emits structured simulation evidence without sending an actual checkout command to the calendar connector or live email to the organizer
+- [ ] In dry-run mode, the full countdown, warning, email simulation, and verification sequence executes and emits structured simulation evidence without sending an actual checkout command to the calendar driver or live email to the organizer
 - [ ] Automated tests verify the complete no-show release lifecycle, minimum duration guard, bounded readiness recovery, warning email gating, and Just-In-Time safety aborts using virtualized clocks

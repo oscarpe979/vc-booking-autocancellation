@@ -79,7 +79,7 @@ The service:
 The service is structured into four decoupled layers:
 - **Ingress Layer**: Ingests device telemetry and events. Encapsulated behind an ingress interface that abstracts the transport protocol (`IEventIngressTransport`).
 - **Core Domain Layer**: Contains the room actor workflow coordinator, state machines, safety guards, classification logic, and reconcilers. Contains zero dependencies on external transport or vendor SDKs.
-- **Port Layer**: Defines outbound contracts for hardware presence telemetry (`IRoomPresenceDriver`), in-room user prompt interactions (`IRoomInteractionDriver`), calendar reservation commands (`ICalendarConnector`), device configuration baselines (`IDeviceConfigDriver`), and end-user email communications (`INotificationDriver`).
+- **Port Layer**: Defines outbound contracts for hardware presence telemetry (`IRoomPresenceDriver`), in-room user prompt interactions (`IRoomInteractionDriver`), calendar reservation commands (`ICalendarDriver`), device configuration baselines (`IDeviceConfigDriver`), and end-user email communications (`INotificationDriver`).
 - **Adapter Layer**: Implements the port contracts for specific platforms (Phase 1: Cisco Webex Workspace Integration for hardware/calendar, and Corporate SMTP relay for email notifications).
 
 ### 2. Outbound Long-Polling Ingress Transport
@@ -168,7 +168,7 @@ To accommodate corporate development laptop security constraints alongside priva
 - A test is considered valid only if it asserts that unsafe cancellations are blocked and valid cancellations proceed under exact, verified conditions.
 
 ### 2. Testing Seams
-- **Primary Domain Seam**: The domain engine will be tested by driving it through its input events (presence changes, calendar updates, prompt responses) and asserting on calls made to mock implementations of `IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarConnector`, and `INotificationDriver`.
+- **Primary Domain Seam**: The domain engine will be tested by driving it through its input events (presence changes, calendar updates, prompt responses) and asserting on calls made to mock implementations of `IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarDriver`, and `INotificationDriver`.
 - **Ingress Seam**: Ingress transports will be tested by delivering synthetic Webex JSON notification payloads and verifying correct dispatch to the domain engine.
 - **Time Virtualization**: All timers and countdowns will be tested using virtualized/mock clocks to verify warning windows and empty-room timeouts deterministically in milliseconds without real-world delays.
 
