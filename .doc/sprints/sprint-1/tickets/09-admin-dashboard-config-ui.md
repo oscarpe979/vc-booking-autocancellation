@@ -14,6 +14,7 @@
   - Empty-room timeout (EMPTY_ROOM_TIMEOUT_MS), warning duration (PRE_TIMEOUT_WARNING_MS), and grace period (POST_TIMEOUT_GRACE_PERIOD_MS)
   - Long-meeting exemption threshold (LONG_MEETING_EXEMPTION_THRESHOLD_MS)
   - VIP / organizer exemption list (EXEMPT_ORGANIZERS) and meeting title keyword exemptions (EXEMPT_TITLE_KEYWORDS)
+  - Corporate SMTP relay settings: host (SMTP_HOST, e.g. outlook.suncorp.com.au), port (SMTP_PORT, e.g. 25), sender address (SMTP_FROM), TLS toggle (SMTP_SECURE), and global notifications toggle (NOTIFICATIONS_ENABLED)
   - Per-room operational mode toggles (MONITOR_ONLY, DRY_RUN, LIVE)
-- [ ] Updates made via the configuration panel take effect immediately on active and future room lifecycles
-- [ ] Automated tests verify dashboard HTML rendering, emergency kill-switch state toggling, and configuration update persistence in memory
+- [ ] Updates made via the configuration panel take effect immediately on active and future room lifecycles and outbound email dispatches
+- [ ] Automated tests verify dashboard HTML rendering, emergency kill-switch state toggling, SMTP setting updates, and configuration update persistence in memory

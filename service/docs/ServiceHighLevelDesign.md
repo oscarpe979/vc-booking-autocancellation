@@ -10,10 +10,11 @@ The service transitions the existing single-codec RoomOS macro logic to a centra
 - **Managed Fleet**: Approximately 800 corporate meeting rooms.
 - **Calendar Provider**: Microsoft Exchange (connected through Cisco Webex Control Hub Hybrid Calendar / Room Booking services for Phase 1).
 - **Device Ecosystem**: Cisco RoomOS codecs (Room Kit, Room Bar, Board, Desk Pro) accessed via the Webex Workspace Integration framework.
+- **Notification Channel**: Corporate Email Notifications via Enterprise SMTP Relay (`outlook.suncorp.com.au:25`) dispatched to meeting organizers for warning alerts and cancellation confirmations.
 - **Hardware Agnosticism**: Standardized Hardware Abstraction Layer (HAL) allowing future replacement or augmentation of codecs with alternative hardware vendors (e.g., Poly, Neat, Logitech) or third-party occupancy sensors.
 - **Runtime Environment**:
-  - **Local Development**: Node.js / TypeScript running locally on engineer workstations via outbound long-polling (zero inbound firewall pinholes, zero ngrok/tunneling required).
-  - **Production Target**: Red Hat Enterprise Linux (RHEL 9) single-instance / Multi-AZ Auto Scaling Group (Min=1, Max=1) on AWS EC2, managed via native `systemd` and monitored via AWS CloudWatch.
+  - **Local Development**: Node.js / TypeScript running locally on engineer workstations via outbound long-polling (zero inbound firewall pinholes, zero ngrok/tunneling required) with mock email logging.
+  - **Production Target (AWS)**: Modular infrastructure provisioned via Terraform, designed to run with maximum operational simplicity in private VPC subnets with outbound connectivity to Webex (HTTPS 443) and corporate SMTP (`outlook.suncorp.com.au:25`). Supports either a containerized task (AWS ECS Fargate) or a hardened single-instance VM (AWS EC2 RHEL 9 with `systemd` supervisor under a Min=1, Max=1 Auto Scaling Group).
 
 ---
 
@@ -32,8 +33,9 @@ Otherwise: preserve the booking and take no action.
 ### Core Invariants:
 1. **Never Delete**: The service requests `CheckOut`; it never invokes destructive calendar deletion commands.
 2. **Actionable Warning Surface Required**: In production, an empty-room release cannot execute unless an actionable prompt (`Keep Booking` / `Check Out`) was successfully displayed to a physical in-room touch surface or certified interactive display.
-3. **Fail-Closed on Startup / Restart**: Any meeting underway when the service starts or restarts is placed into an immediate **Startup Check-In Quarantine** (`AwaitingStartupCheckIn`). It will never be auto-cancelled unless fresh occupancy and check-in confirmation are observed.
-4. **Just-In-Time (JIT) Verification Probe**: Immediately prior to issuing a release command at $T=0$, the service executes a synchronous, real-time read directly against the room hardware to guarantee the space is still vacant and the booking identity has not changed.
+3. **Mandatory Warning Email Precondition**: Automatic room cancellation requires that a cancellation warning email was successfully dispatched to the meeting organizer when the in-room warning prompt was shown. If email dispatch fails after bounded retries, the service fails closed and preserves the booking (zero surprise cancellations).
+4. **Fail-Closed on Startup / Restart**: Any meeting underway when the service starts or restarts is placed into an immediate **Startup Check-In Quarantine** (`AwaitingStartupCheckIn`). It will never be auto-cancelled unless fresh occupancy and check-in confirmation are observed.
+5. **Just-In-Time (JIT) Verification Probe**: Immediately prior to issuing a release command at $T=0$, the service executes a synchronous, real-time read directly against the room hardware to guarantee the space is still vacant and the booking identity has not changed.
 
 ---
 
@@ -75,15 +77,15 @@ The service is structured according to Hexagonal Architecture (Ports and Adapter
 |                                                |                                                   |
 |                                                v                                                   |
 |                                     DOMAIN PORTS (SEAMS)                                           |
-|                     +--------------------------+--------------------------+                        |
-|                     |                          |                          |                        |
-|                     v                          v                          v                        |
-|            IRoomPresenceDriver        IRoomInteractionDriver      ICalendarConnector               |
-|            (Occupancy Telemetry)      (In-Room UI & Audio)        (Bookings/CheckIn/Out)           |
-|                     |                          |                          |                        |
-+---------------------|--------------------------|--------------------------|------------------------+
-                      |                          |                          |
-                      v                          v                          v
+|                     +------------------+------------------+------------------+                    |
+|                     |                  |                  |                  |                    |
+|                     v                  v                  v                  v                    |
+|            IRoomPresenceDriver  IRoomInteraction  ICalendarConnector  INotificationDriver         |
+|            (Occupancy)          (In-Room UI)      (Bookings/CheckIn)  (Email Notifications)       |
+|                     |                  |                  |                  |                    |
++---------------------|------------------|------------------|------------------|--------------------+
+                      |                  |                  |                  |
+                      v                  v                  v                  v
 +----------------------------------------------------------------------------------------------------+
 |                                        ADAPTER LAYER                                               |
 |                                                                                                    |
@@ -98,6 +100,12 @@ The service is structured according to Hexagonal Architecture (Ports and Adapter
 |     +-----------------------------------------------------------------------------------------+    |
 |                                                                                                    |
 |     +-----------------------------------------------------------------------------------------+    |
+|     |                             Notification Adapters                                       |    |
+|     |   * SmtpNotificationAdapter: Outbound SMTP over port 25 (outlook.suncorp.com.au:25)     |    |
+|     |   * MockNotificationDriver: Local dev/testing console logger & EML preview capture      |    |
+|     +-----------------------------------------------------------------------------------------+    |
+|                                                                                                    |
+|     +-----------------------------------------------------------------------------------------+    |
 |     |                      Future Adapters (Pluggable Hardware Modules)                       |    |
 |     |     * Poly / Neat Presence Driver       * Microsoft Graph Direct Calendar Connector      |    |
 |     +-----------------------------------------------------------------------------------------+    |
@@ -108,7 +116,7 @@ The service is structured according to Hexagonal Architecture (Ports and Adapter
 
 ## 4. Domain Ports & Driver Abstractions
 
-To achieve true hardware vendor agnosticism, the domain boundary defines four distinct interfaces:
+To achieve true hardware vendor and notification provider agnosticism, the domain boundary defines five distinct interfaces:
 
 ### 4.1 Presence Driver (`IRoomPresenceDriver`)
 Abstracts physical occupancy detection:
@@ -143,6 +151,18 @@ Abstracts baseline configuration enforcement and native check-in policy:
 - `enforceBaselinePresenceConfig(roomId: string): Promise<boolean>`: Enforces `PeoplePresenceDetector: On`, `HeadDetector: On`, `PeopleCountOutOfCall: On`, `RoomInUse.InCall: Enabled`, `RoomInUse.LocalUsage: Enabled`, and `Ultrasound`.
 - `enforceNativeCheckInWindow(roomId: string, windowMinutes: number): Promise<boolean>`: Enforces `Bookings.CheckIn.WindowDuration: 60` to prevent native RoomOS no-show release from racing ahead of service safety policy.
 - `setNativeCheckInEnabled(roomId: string, enabled: boolean): Promise<boolean>`: Serializes writes through FIFO queue with freshness checks: sets `False` for long/unclassifiable meetings, sets `True` for allowed short meetings, restores `True` when meeting ends / room is free.
+
+### 4.5 Notification Driver (`INotificationDriver`)
+Abstracts end-user email communications:
+- `sendCancellationWarning(payload: CancellationWarningPayload): Promise<NotificationResult>`: Dispatches an urgent warning email to the meeting organizer when the in-room countdown prompt is triggered.
+  - **Dynamic Time Calculation**: Never hardcodes minutes; calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (e.g. 5m, 3m) and formats the impending release time in the codec's local clock timezone.
+  - **Single Warning Invariant**: Tracked per booking lifecycle; re-displaying a dismissed prompt (`restoreDismissedPrompt`) never re-sends or spams duplicate warning emails.
+  - **Delivery Verification & Fail-Closed Gate**: Warning email delivery is tracked. If SMTP dispatch fails (after bounded immediate retries), the service records the delivery failure, fails closed, and **aborts the cancellation** to prevent surprise releases.
+- `sendCancellationNotice(payload: CancellationNoticePayload): Promise<NotificationResult>`: Dispatches a conclusive cancellation notice to the meeting organizer immediately following a successful calendar `checkOut()`.
+  - **Differentiated Templates**: Contextual messaging explicitly distinguishing **No-Show Release** (room unoccupied after meeting start) from **Early Departure Release** (room vacated and left empty before scheduled end time).
+- **Template Presentation**: Responsive multipart MIME (HTML with structured corporate branding, room name, scheduled meeting time, and clear bullet instructions) accompanied by an RFC-compliant plain-text fallback.
+- **Enterprise SMTP Adapter**: Implemented by `SmtpNotificationAdapter` connecting to `outlook.suncorp.com.au:25` via unauthenticated direct relay (with configurable overrides for port, credentials, and TLS in the admin dashboard).
+- **Simulation Safety**: In `DRY_RUN` and `MONITOR_ONLY` modes, physical SMTP delivery is suppressed; the adapter emits structured `[DRY RUN - WOULD_SEND_EMAIL]` audit logs.
 
 ---
 
@@ -193,14 +213,21 @@ The room workflow state machine models every active meeting through strict lifec
 2. **Booking Sync Coalescing**: Buffers rapid bursts of `BookedUntil` and `TimeStamp` events for 50ms before reading booking details to ensure an atomic snapshot.
 3. **Bounded Readiness Recovery**: If transient metadata is missing (`Bookings.Current.Id` null or `Bookings.Get` error), retries on `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` with `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` fallback.
 4. **Minimum Remaining Time Guard**: Verifies `timeRemaining = endTime - now`. If `timeRemaining <= EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS` (e.g. $\le 12$ minutes), autocancellation is skipped and logged.
-5. At `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS` (e.g. at 5 minutes into a 10-minute timeout), the service checks for an actionable surface (`hasActionableSurface`).
-6. If valid, the service issues `displayWarning` with initial text and starts the 60s audio chime loop. Controller displays `Keep this booking?`.
-7. If untouched and room remains vacant until timeout + grace period, the JIT Probe verifies vacancy and issues `checkOut`.
+5. At `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS` (e.g. at remaining warning window determined dynamically by `PRE_TIMEOUT_WARNING_MS`), the service checks for an actionable surface (`hasActionableSurface`).
+6. If valid:
+   - The service issues `displayWarning` with initial text and starts the 60s audio chime loop. Controller displays `Keep this booking?`.
+   - The service dispatches `sendCancellationWarning` via `INotificationDriver` to the meeting organizer's email. Warning email delivery is tracked; if delivery fails after immediate retries, the service fails closed and marks the booking protected from release.
+7. If untouched and room remains vacant until timeout + grace period:
+   - The JIT Probe verifies vacancy and unchanged booking identity.
+   - The service issues `checkOut`.
+   - Upon confirmed checkout, the service dispatches `sendCancellationNotice` (No-Show template) to the organizer.
 
 ### 5.2 Early Departure Release Policy
 1. Meeting started and was checked in (either manually, via ad hoc booking, or auto-checkin).
 2. Attendees leave early. Presence changes to `Empty`.
-3. If `EARLY_DEPARTURE_RELEASE_ENABLED` is true, the service initiates the empty-room countdown and warning prompt sequence.
+3. If `EARLY_DEPARTURE_RELEASE_ENABLED` is true, the service initiates the empty-room countdown:
+   - At `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS`, displays in-room warning and dispatches `sendCancellationWarning` to the organizer.
+   - If vacated until timeout + grace period, executes JIT Probe, issues `checkOut`, and dispatches `sendCancellationNotice` (Early Departure template).
 
 ### 5.3 Long Meeting & Group/VIP Exemption Policy
 1. **Long-Meeting Exemption**: Current bookings exceeding `LONG_MEETING_EXEMPTION_THRESHOLD_MS` (default 120 minutes) or unclassifiable bookings are classified as `Long` or `Unclassifiable`. Autocancellation is strictly `Blocked`.
@@ -245,8 +272,8 @@ To prevent drift between external service memory and physical room states, the s
 
 ### 7.2 Progressive Rollout Roster
 Each room record maintains an execution mode:
-- `MONITOR_ONLY`: Observes and logs telemetry; executes no prompts or booking commands.
-- `DRY_RUN`: Simulates countdowns and logs `[DRY RUN - WOULD_DISPLAY_PROMPT]` and `[DRY RUN - WOULD_RELEASE]`; suppresses booking commands.
+- `MONITOR_ONLY`: Observes and logs telemetry; executes no prompts, emails, or booking commands.
+- `DRY_RUN`: Simulates countdowns, logs `[DRY RUN - WOULD_DISPLAY_PROMPT]`, `[DRY RUN - WOULD_SEND_EMAIL]`, and `[DRY RUN - WOULD_RELEASE]`; suppresses external commands and live emails.
 - `LIVE`: Full autonomous operation.
 
 ### 7.3 Automated Anomaly Tripwire & Emergency Kill Switch
@@ -263,6 +290,8 @@ The service embeds a lightweight, server-rendered administration and configurati
   - `LONG_MEETING_EXEMPTION_THRESHOLD_MS`
   - `EXEMPT_ORGANIZERS` (comma-separated list of VIP emails)
   - `EXEMPT_TITLE_KEYWORDS` (e.g., "Board Review", "Confidential", "Executive")
+  - `NOTIFICATIONS_ENABLED` (global toggle for email notifications)
+  - `SMTP_HOST` (e.g. `outlook.suncorp.com.au`), `SMTP_PORT` (e.g. 25), `SMTP_FROM` (e.g. `no-reply-roombookings@suncorp.com.au`), `SMTP_SECURE`
   - Per-room mode toggles (`MONITOR_ONLY` / `DRY_RUN` / `LIVE`)
 
 ---
@@ -272,12 +301,23 @@ The service embeds a lightweight, server-rendered administration and configurati
 ### 8.1 Local Developer Workflow (Laptop)
 - Engineer runs `npm run dev`.
 - Service loads `.env.local` with `NOTIFICATION_MODE=longpolling`.
-- Service initiates an outbound HTTPS connection to the Webex cloud integration message queue.
-- Events from test rooms are delivered directly to the laptop. Zero inbound firewall configuration, zero ngrok tunnels.
+- Outbound HTTPS long-polling handles Webex device events with zero inbound ports.
+- `MockNotificationDriver` captures warning and cancellation emails, formatting rich previews to the terminal console and recording them in memory for test verification.
 
-### 8.2 Production Infrastructure (AWS EC2 RHEL 9)
-- **Host**: Single EC2 instance (`t4g.small` or `t3.small`) inside a private VPC subnet.
-- **High Availability**: Managed by an AWS Auto Scaling Group (Min=1, Max=1, Desired=1) spanning two Availability Zones. If the host or AZ fails, ASG launches a replacement instance in the healthy AZ within 2–3 minutes.
-- **Process Supervisor**: Linux `systemd` (`booking-autocancel.service`) with `Restart=always` and memory limits.
-- **Configuration & Secrets**: Injected from AWS SSM Parameter Store (`SecureString`) at startup via IAM instance profile. Zero plaintext credentials on disk.
-- **Observability**: AWS CloudWatch Agent forwards structured JSON logs from `journald` to CloudWatch Logs with metric alarms configured for failed checkouts and tripwire events.
+### 8.2 Production Infrastructure on AWS (Terraform-Provisioned)
+To keep cloud operations as simple, maintainable, and reliable as possible, the AWS infrastructure is fully codified via Terraform. The architecture is intentionally compute-agnostic, supporting either a containerized service or a dedicated VM depending on organizational hosting standards:
+
+- **Compute Option A (Containerized - AWS ECS Fargate)**:
+  - Runs as a single active task (Min=1, Max=1) managed by an ECS Service.
+  - Zero OS maintenance, zero AMI patching, instant container startup.
+  - Automatically restarts failed tasks within seconds.
+- **Compute Option B (Virtual Machine - AWS EC2 RHEL 9)**:
+  - Single instance (`t4g.small` or `t3.small`) managed by an Auto Scaling Group (Min=1, Max=1, Desired=1) across two Availability Zones.
+  - Process supervised natively by Linux `systemd` (`booking-autocancel.service`) with `Restart=always`.
+- **Common Network & Security Architecture**:
+  - **VPC Subnets**: Deployed strictly inside private subnets (zero public IP, zero inbound security group rules).
+  - **Outbound Egress**:
+    - Outbound HTTPS (TCP 443) to Webex Cloud APIs for long-polling telemetry.
+    - Outbound SMTP (TCP 25) routed across the enterprise network / Direct Connect / Transit Gateway to `outlook.suncorp.com.au`.
+  - **Zero Plaintext Secrets**: Webex credentials and secrets injected from AWS SSM Parameter Store (`SecureString`) at startup via IAM role / instance profile.
+  - **Observability**: CloudWatch Logs integration with structured JSON audit streams, CloudWatch Metric Filters for cancellation counts, and alarms on tripwire triggers.

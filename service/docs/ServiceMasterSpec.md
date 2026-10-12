@@ -24,6 +24,8 @@ The service:
 4. Enforces a synchronous Two-Tier Reconciler with a Just-In-Time (JIT) direct verification probe at the exact second of scheduled release to guarantee rooms are never released by mistake due to stale events or network latency.
 5. Decouples hardware presence and interaction from calendar operations through standard driver interfaces, allowing Phase 1 to operate against Cisco Webex Workspace Integrations while allowing future hardware swaps to be performed simply by authoring new driver modules.
 6. Provides fleet-wide operational safety controls including staged rollout modes (`MONITOR_ONLY`, `DRY_RUN`, `LIVE`), an automated cancellation spike tripwire, and an instant emergency kill-switch.
+7. Delivers direct end-user notifications via an enterprise corporate SMTP relay (`outlook.suncorp.com.au:25`), sending urgent cancellation warnings when in-room prompts appear and contextual cancellation receipts when rooms are released, with a strict fail-closed delivery guard protecting bookings if email delivery fails.
+8. Deploys cleanly into AWS via Terraform with flexible compute support (either an AWS ECS Fargate containerized task or a dedicated EC2 RHEL 9 instance supervised by `systemd`), operating inside private VPC subnets with outbound HTTPS 443 and SMTP 25 egress.
 
 ---
 
@@ -62,6 +64,12 @@ The service:
 31. As an enterprise IT collaboration administrator, I want a lightweight web dashboard to view live room statuses, toggle the emergency kill switch, and update exemption rules and timeout parameters without modifying code or restarting the service.
 32. As a meeting organizer with a short remaining meeting duration (e.g. 12 minutes or less), I want autocancellation skipped, so that meetings about to conclude naturally are preserved without nuisance warnings.
 33. As an in-room meeting organizer who booked the room directly from the touch controller (ad hoc), I want automatic check-in suppressed, so that the service respects native on-device booking workflows.
+34. As a meeting organizer away from the room, I want to receive an urgent cancellation warning email when the in-room countdown prompt is displayed, so that I am alerted to the impending cancellation and given the opportunity to occupy the room or confirm via the controller.
+35. As a meeting organizer, I want the warning email to state the exact remaining countdown time dynamically based on the configured warning window and the room's local clock time, so that the message accurately reflects my remaining grace period.
+36. As a meeting organizer, I want the cancellation to be aborted and my booking preserved if the warning email cannot be sent, so that I am never subjected to an unannounced surprise room cancellation.
+37. As a meeting organizer whose room was cancelled, I want to receive a cancellation notice email detailing the room name, scheduled time, and whether it was released due to a No-Show or an Early Departure, so that I have a clear record of why the space was freed.
+38. As an enterprise IT collaboration administrator, I want to configure the corporate SMTP host, port, sender email, and notification enable/disable switch from the `/admin` dashboard, so that mail delivery settings can be updated at runtime without redeploying code.
+39. As a cloud operations engineer, I want the AWS production environment fully codified in Terraform with support for either an AWS ECS Fargate container or an EC2 RHEL 9 instance in private subnets, so that infrastructure provisioning is repeatable, simple to manage, and secure.
 
 ---
 
@@ -69,10 +77,10 @@ The service:
 
 ### 1. Hexagonal Modular Architecture
 The service is structured into four decoupled layers:
-- **Ingress Layer**: Ingests device telemetry and events. Encapsulated behind an ingress interface that abstracts the transport protocol.
+- **Ingress Layer**: Ingests device telemetry and events. Encapsulated behind an ingress interface that abstracts the transport protocol (`IEventIngressTransport`).
 - **Core Domain Layer**: Contains the room actor workflow coordinator, state machines, safety guards, classification logic, and reconcilers. Contains zero dependencies on external transport or vendor SDKs.
-- **Port Layer**: Defines outbound contracts for hardware presence telemetry, in-room user prompt interactions, calendar reservation commands, and device configuration baselines.
-- **Adapter Layer**: Implements the port contracts for specific platforms (Phase 1: Cisco Webex Workspace Integration).
+- **Port Layer**: Defines outbound contracts for hardware presence telemetry (`IRoomPresenceDriver`), in-room user prompt interactions (`IRoomInteractionDriver`), calendar reservation commands (`ICalendarConnector`), device configuration baselines (`IDeviceConfigDriver`), and end-user email communications (`INotificationDriver`).
+- **Adapter Layer**: Implements the port contracts for specific platforms (Phase 1: Cisco Webex Workspace Integration for hardware/calendar, and Corporate SMTP relay for email notifications).
 
 ### 2. Outbound Long-Polling Ingress Transport
 To accommodate corporate development laptop security constraints alongside private cloud hosting:
@@ -107,16 +115,17 @@ To accommodate corporate development laptop security constraints alongside priva
 
 ### 8. Progressive Rollout & Safety Controls
 - **Per-Room Mode**: Each room configuration specifies `MONITOR_ONLY`, `DRY_RUN`, or `LIVE`.
-- **Dry-Run Emulation**: Executes full countdown, classification, and prompt tracking, but suppresses physical prompt displays and checkout commands, emitting structured simulation logs.
+- **Dry-Run Emulation**: Executes full countdown, classification, and prompt tracking, but suppresses physical prompt displays, live email dispatches, and checkout commands, emitting structured simulation logs (`[DRY RUN - WOULD_SEND_EMAIL]`, `[DRY RUN - WOULD_RELEASE]`).
 - **Anomaly Tripwire**: Tracks global cancellations across a sliding 5-minute window; automatically trips into safe hold if cancellations exceed 30 within that window.
 - **Emergency Kill Switch**: Evaluates a dynamic flag (`AUTOCANCEL_KILL_SWITCH`) that halts all booking-changing actions instantly.
 
-### 9. Target Production Infrastructure
-- Single Red Hat Enterprise Linux 9 instance on AWS EC2 (`t4g.small` ARM or `t3.small` x86).
-- High availability via AWS Auto Scaling Group configured with Min=1, Max=1, Desired=1 spanning two Availability Zones.
-- Supervised natively by Linux `systemd` (`Restart=always`).
-- Zero plaintext credentials on disk; credentials fetched at startup from AWS SSM Parameter Store (`SecureString`).
-- Observability via AWS CloudWatch Agent shipping `journald` JSON logs to CloudWatch Log Groups.
+### 9. Target Production Infrastructure on AWS (Terraform-Provisioned)
+- Designed for maximum operational simplicity and reliability in AWS, fully codified in Terraform with support for flexible compute:
+  - **Option A (Containerized - AWS ECS Fargate)**: Single task definition running in private subnets, managed by an ECS Service (Desired=1), with zero OS patching or host maintenance.
+  - **Option B (Virtual Machine - AWS EC2 RHEL 9)**: Single instance (`t4g.small` or `t3.small`) managed by an Auto Scaling Group (Min=1, Max=1, Desired=1) across two Availability Zones, supervised natively by Linux `systemd` (`Restart=always`).
+- **Private Subnets & Egress**: Runs strictly inside private VPC subnets with outbound HTTPS 443 egress to Webex Cloud and outbound TCP 25 egress routed to `outlook.suncorp.com.au` via corporate network connections.
+- **Zero Plaintext Credentials**: Credentials and tokens fetched at startup from AWS SSM Parameter Store (`SecureString`) via IAM roles.
+- **Observability**: AWS CloudWatch Agent / FireLens streaming structured JSON logs to CloudWatch Log Groups with metric alarms.
 
 ### 10. In-Room Audio Chimes, Dual Presentation & Dismissed Prompt Restoration
 - When the warning prompt appears, the service overrides volume to 70%, plays the `Announcement` sound, holds for 4 seconds, restores volume to default, and repeats every 60 seconds.
@@ -138,7 +147,16 @@ To accommodate corporate development laptop security constraints alongside priva
 - Prominent 1-click Emergency Kill Switch.
 - Search box for filtering rooms by name, ID, organizer, or status.
 - Real-time fleet status table showing lifecycle phase, presence, and countdown timer.
-- Web form allowing administrators to view and update timeout durations, long meeting thresholds, VIP organizer exemptions, and per-room operational modes without code changes.
+- Web form allowing administrators to view and update timeout durations, long meeting thresholds, VIP organizer exemptions, per-room operational modes, and SMTP relay settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_SECURE`, `NOTIFICATIONS_ENABLED`) without code changes.
+
+### 14. Corporate SMTP Email Notification Engine
+- **Decoupled Outbound Port**: Encapsulated behind `INotificationDriver` and implemented via `SmtpNotificationAdapter` connecting to `outlook.suncorp.com.au:25` as an unauthenticated direct relay (standard for corporate internal smart hosts).
+- **Mandatory Warning Email Precondition (Fail-Closed)**: When the in-room countdown warning prompt is displayed, an urgent warning email is dispatched to the meeting organizer. The service requires successful delivery verification; if SMTP dispatch fails after immediate retries, the cancellation workflow is aborted and the booking is preserved to prevent unannounced releases.
+- **Dynamic Timing & Local Clock Presentation**: The warning email dynamically calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (never hardcoded 5 minutes) and displays the release time in the codec's local clock timezone.
+- **Single Warning Invariant**: Tracked per booking lifecycle; prompt dismissals and re-displays (`restoreDismissedPrompt`) do not send duplicate warning emails.
+- **Differentiated Cancellation Receipts**: Upon successful calendar release, dispatches a conclusive receipt explicitly distinguishing **No-Show Release** from **Early Departure Release**.
+- **Template Architecture**: Multipart MIME (HTML + RFC-compliant plain text) with corporate styling, meeting title, room location, and clear action guidance.
+- **Local Development**: Emulated via `MockNotificationDriver` with formatted terminal logging and in-memory capture for test assertions.
 
 ---
 
@@ -150,18 +168,19 @@ To accommodate corporate development laptop security constraints alongside priva
 - A test is considered valid only if it asserts that unsafe cancellations are blocked and valid cancellations proceed under exact, verified conditions.
 
 ### 2. Testing Seams
-- **Primary Domain Seam**: The domain engine will be tested by driving it through its input events (presence changes, calendar updates, prompt responses) and asserting on calls made to mock implementations of `IRoomPresenceDriver`, `IRoomInteractionDriver`, and `ICalendarConnector`.
+- **Primary Domain Seam**: The domain engine will be tested by driving it through its input events (presence changes, calendar updates, prompt responses) and asserting on calls made to mock implementations of `IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarConnector`, and `INotificationDriver`.
 - **Ingress Seam**: Ingress transports will be tested by delivering synthetic Webex JSON notification payloads and verifying correct dispatch to the domain engine.
-- **Time Virtualization**: All timers and countdowns will be tested using virtualized/mock clocks to verify 5-minute warnings and 10-minute timeouts deterministically in milliseconds without real-world delays.
+- **Time Virtualization**: All timers and countdowns will be tested using virtualized/mock clocks to verify warning windows and empty-room timeouts deterministically in milliseconds without real-world delays.
 
 ### 3. Core Test Scenarios
-- **No-Show Release Lifecycle**: Empty room triggers countdown, warning prompt displays at 5 min, room remains empty, JIT probe confirms vacancy, checkout is issued.
-- **User Keep Booking**: Warning prompt displays; user selects "Keep Booking"; prompt dismisses; meeting is preserved; countdown resets safely.
+- **No-Show Release Lifecycle**: Empty room triggers countdown, warning prompt displays, warning email dispatches to organizer, room remains empty, JIT probe confirms vacancy, checkout is issued, cancellation email dispatches.
+- **User Keep Booking**: Warning prompt displays; user selects "Keep Booking"; prompt dismisses; meeting is preserved; countdown resets safely; no duplicate warning email sent on subsequent prompt restoration.
 - **User Early Checkout**: User selects "Check Out"; confirmation prompt displays; user confirms; checkout is executed immediately.
 - **Occupancy Interruption**: Room becomes occupied during countdown; countdown cancels; meeting preserved.
 - **Startup Quarantine**: Service starts with active meeting; room is empty; no countdown or release occurs; meeting remains quarantined until fresh check-in.
-- **Long Meeting Exemption**: 3-hour meeting begins; room is empty; autocancellation is blocked; no prompt or checkout occurs.
+- **Long Meeting Exemption**: 3-hour meeting begins; room is empty; autocancellation is blocked; no prompt, email, or checkout occurs.
 - **JIT Verification Abort**: Room is empty throughout countdown, but person enters at $T=0$ before checkout; JIT probe detects presence; checkout command is suppressed; booking preserved.
+- **Notification Failure Fail-Closed**: Warning prompt displays, but mock notification driver throws delivery failure; cancellation is aborted; booking is preserved.
 - **Tripwire Activation**: Simulated burst of 31 cancellations within 5 minutes causes engine to freeze subsequent releases.
 
 ---
@@ -171,7 +190,7 @@ To accommodate corporate development laptop security constraints alongside priva
 1. **Creating, Modifying, or Deleting Calendar Bookings**: The service only issues `CheckIn` and `CheckOut`; it never creates new bookings or invokes `Delete`.
 2. **Direct Microsoft Exchange / Graph API Integration in Phase 1**: Exchange connectivity is delegated to Webex Control Hub Hybrid Calendar services in the initial release.
 3. **Custom On-Device UI Extensions**: The service utilizes native Webex modal prompts (`UserInterface.Message.Prompt.Display`); custom in-room XML UI extensions or web panels are out of scope.
-4. **Attendee Email / Chat Notifications**: External SMTP, Power Automate, or Teams chat notifications to meeting organizers are deferred to a future phase.
+4. **Attendee / Chat Spam**: Notifying all meeting attendees or sending Microsoft Teams / Webex chat messages is excluded to protect confidentiality and prevent notification fatigue. Emails are strictly targeted to the meeting organizer.
 5. **Physical Sensor Calibration**: Sensor tuning and hardware ultrasound thresholds remain the responsibility of device engineering.
 
 ---
