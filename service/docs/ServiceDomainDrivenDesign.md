@@ -69,7 +69,7 @@ flowchart LR
     IngressPoll -->|"Room Events"| RoomActor
     IngressAdmin -->|"Config Updates"| FleetConfig
     FleetConfig -->|"Applies Rules"| RoomActor
-    RoomActor <-->|"Enforces"| RulesEngine
+    RoomActor -->|"Enforces"| RulesEngine
 
     %% ACTOR DISPATCHES THROUGH DOMAIN PORTS
     RoomActor --> P_Presence
@@ -86,7 +86,8 @@ flowchart LR
     P_Notify --> SmtpAdapter
 
     %% ADAPTERS CONNECT TO EXTERNAL SYSTEMS
-    WebexAdapter <--> Ext_Cisco
+    WebexAdapter -->|"xCommand / xConfig"| Ext_Cisco
+    Ext_Cisco -->|"xStatus / xEvent"| WebexAdapter
     WebexAdapter --> Ext_Exchange
     SmtpAdapter --> Ext_Smtp
     Ext_Smtp --> Ext_Users

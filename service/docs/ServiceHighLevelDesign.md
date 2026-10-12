@@ -2,11 +2,12 @@
 
 ## 1. Document Purpose and Scope
 
-This document specifies the target architecture and high-level design for an external, vendor-agnostic meeting room booking autocancellation service. 
+This document specifies the target architecture and high-level design for an external, vendor-agnostic meeting room booking autocancellation service.
 
 The service transitions the existing single-codec RoomOS macro logic to a centralized, multi-room backend service capable of managing ~800 meeting spaces. The service enforces strict policy parity with the codec-native baseline while decoupling room occupancy detection, in-room user interaction, and calendar booking operations behind clean domain boundaries.
 
 ### Initial Deployment Scope
+
 - **Managed Fleet**: Approximately 800 corporate meeting rooms.
 - **Calendar Provider**: Microsoft Exchange (connected through Cisco Webex Control Hub Hybrid Calendar / Room Booking services for Phase 1).
 - **Device Ecosystem**: Cisco RoomOS codecs (Room Kit, Room Bar, Board, Desk Pro) accessed via the Webex Workspace Integration framework.
@@ -20,7 +21,7 @@ The service transitions the existing single-codec RoomOS macro logic to a centra
 
 ## 2. Business Context & Controlling Safety Invariant
 
-Unused reserved rooms reduce collaborative capacity. However, false cancellations disrupt ongoing business meetings, executive reviews, and client presentations. 
+Unused reserved rooms reduce collaborative capacity. However, false cancellations disrupt ongoing business meetings, executive reviews, and client presentations.
 
 The external service inherits the strict, fail-closed safety invariant established in the codec-native solution:
 
@@ -30,7 +31,8 @@ Only when every condition is conclusively verified may an automatic booking acti
 Otherwise: preserve the booking and take no action.
 ```
 
-### Core Invariants:
+### Core Invariants
+
 1. **Never Delete**: The service requests `CheckOut`; it never invokes destructive calendar deletion commands.
 2. **Actionable Warning Surface Required**: In production, an empty-room release cannot execute unless an actionable prompt (`Keep Booking` / `Check Out`) was successfully displayed to a physical in-room touch surface or certified interactive display.
 3. **Mandatory Warning Email Precondition**: Automatic room cancellation requires that a cancellation warning email was successfully dispatched to the meeting organizer when the in-room warning prompt was shown. If email dispatch fails after bounded retries, the service fails closed and preserves the booking (zero surprise cancellations).
@@ -45,7 +47,7 @@ The service is structured according to Hexagonal Architecture (Ports and Adapter
 
 For the comprehensive visual Domain-Driven Design (DDD) architecture model detailing Aggregate Roots, Domain Policies, Safety Guards, and mutable configuration bindings, see [service/docs/ServiceDomainDrivenDesign.md](service/docs/ServiceDomainDrivenDesign.md).
 
-```
+```text
 +----------------------------------------------------------------------------------------------------+
 |                                      INGRESS TRANSPORT LAYER                                       |
 |                                                                                                    |
@@ -121,12 +123,16 @@ For the comprehensive visual Domain-Driven Design (DDD) architecture model detai
 To achieve true hardware vendor and notification provider agnosticism, the domain boundary defines five distinct interfaces:
 
 ### 4.1 Presence Driver (`IRoomPresenceDriver`)
+
 Abstracts physical occupancy detection:
+
 - `getPresence(roomId: string): Promise<RoomPresenceState>`: Queries instantaneous presence (`Occupied`, `Empty`, or `Unknown`).
 - `onPresenceChange(handler: (event: PresenceChangeEvent) => void): void`: Ingests asynchronous presence transitions (`RoomAnalytics.RoomInUse`).
 
 ### 4.2 In-Room Interaction Driver (`IRoomInteractionDriver`)
+
 Abstracts user prompts, warnings, audio chimes, and touch responses:
+
 - `hasActionableSurface(roomId: string): Promise<boolean>`: Discovers touch panels (`Status.Peripherals.ConnectedDevice` with `Status: Connected`, `Type: TouchPanel`, `Role: Controller`) and certified interactive displays (`SystemUnit.ProductPlatform = 'Desk Pro'`). Strictly filters out non-controller panels such as `RoomScheduler` Navigators.
 - `displayWarning(roomId: string, prompt: WarningPromptRequest): Promise<PromptDisplayResult>`: Shows dual presentation:
   - Controller prompt: actionable buttons (`Option.1: Keep Booking`, `Option.2: Check Out`).
@@ -141,7 +147,9 @@ Abstracts user prompts, warnings, audio chimes, and touch responses:
 - `onPromptCleared(handler: (event: PromptClearedEvent) => void): void`: Ingests prompt dismissal events.
 
 ### 4.3 Calendar Driver (`ICalendarDriver`)
+
 Abstracts meeting reservation metadata and release execution:
+
 - `getAvailability(roomId: string): Promise<RoomAvailabilitySnapshot>`: Returns `Free`, `FreeUntil`, or `BookedUntil` with timestamps.
 - `getBookingDetails(roomId: string, bookingId: string): Promise<BookingDetails>`: Queries `Bookings.Get({ Id })` with fallback to `Bookings.List({ ScheduleType: 'Current', Limit: 1 })`. Includes `BookedFromDevice` flag, organizer email/name, meeting title, start/end timestamps.
 - `checkIn(roomId: string, bookingId: string, trackingData?: string): Promise<void>`: Executes meeting check-in with `TrackingData: 'BookingAutoCancellation_Automatic'`.
@@ -149,13 +157,17 @@ Abstracts meeting reservation metadata and release execution:
 - `onCheckedIn(handler: (event: CheckedInEvent) => void): void`: Ingests meeting check-in events (`Event.Bookings.CheckedIn`).
 
 ### 4.4 Device Configuration Driver (`IDeviceConfigDriver`)
+
 Abstracts baseline configuration enforcement and native check-in policy:
+
 - `enforceBaselinePresenceConfig(roomId: string): Promise<boolean>`: Enforces `PeoplePresenceDetector: On`, `HeadDetector: On`, `PeopleCountOutOfCall: On`, `RoomInUse.InCall: Enabled`, `RoomInUse.LocalUsage: Enabled`, and `Ultrasound`.
 - `enforceNativeCheckInWindow(roomId: string, windowMinutes: number): Promise<boolean>`: Enforces `Bookings.CheckIn.WindowDuration: 60` to prevent native RoomOS no-show release from racing ahead of service safety policy.
 - `setNativeCheckInEnabled(roomId: string, enabled: boolean): Promise<boolean>`: Serializes writes through FIFO queue with freshness checks: sets `False` for long/unclassifiable meetings, sets `True` for allowed short meetings, restores `True` when meeting ends / room is free.
 
 ### 4.5 Notification Driver (`INotificationDriver`)
+
 Abstracts end-user email communications:
+
 - `sendCancellationWarning(payload: CancellationWarningPayload): Promise<NotificationResult>`: Dispatches an urgent warning email to the meeting organizer when the in-room countdown prompt is triggered.
   - **Dynamic Time Calculation**: Never hardcodes minutes; calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (e.g. 5m, 3m) and formats the impending release time in the codec's local clock timezone.
   - **Single Warning Invariant**: Tracked per booking lifecycle; re-displaying a dismissed prompt (`restoreDismissedPrompt`) never re-sends or spams duplicate warning emails.
@@ -172,7 +184,7 @@ Abstracts end-user email communications:
 
 The room workflow state machine models every active meeting through strict lifecycle phases:
 
-```
+```text
   +--------------+
   |     Idle     | <------------------------------------------+
   +-------+------+                                            |
@@ -211,6 +223,7 @@ The room workflow state machine models every active meeting through strict lifec
 ```
 
 ### 5.1 No-Show Release Policy
+
 1. Meeting starts, room remains vacant, no check-in recorded.
 2. **Booking Sync Coalescing**: Buffers rapid bursts of `BookedUntil` and `TimeStamp` events for 50ms before reading booking details to ensure an atomic snapshot.
 3. **Bounded Readiness Recovery**: If transient metadata is missing (`Bookings.Current.Id` null or `Bookings.Get` error), retries on `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` with `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` fallback.
@@ -225,6 +238,7 @@ The room workflow state machine models every active meeting through strict lifec
    - Upon confirmed checkout, the service dispatches `sendCancellationNotice` (No-Show template) to the organizer.
 
 ### 5.2 Early Departure Release Policy
+
 1. Meeting started and was checked in (either manually, via ad hoc booking, or auto-checkin).
 2. Attendees leave early. Presence changes to `Empty`.
 3. If `EARLY_DEPARTURE_RELEASE_ENABLED` is true, the service initiates the empty-room countdown:
@@ -232,17 +246,21 @@ The room workflow state machine models every active meeting through strict lifec
    - If vacated until timeout + grace period, executes JIT Probe, issues `checkOut`, and dispatches `sendCancellationNotice` (Early Departure template).
 
 ### 5.3 Long Meeting & Group/VIP Exemption Policy
+
 1. **Long-Meeting Exemption**: Current bookings exceeding `LONG_MEETING_EXEMPTION_THRESHOLD_MS` (default 120 minutes) or unclassifiable bookings are classified as `Long` or `Unclassifiable`. Autocancellation is strictly `Blocked`.
 2. **VIP & Group Exemption**: Meetings organized by individuals in `EXEMPT_ORGANIZERS` (e.g. executive assistants, C-suite) or matching configured department/title tags are classified as `Exempt` and blocked from release.
 3. **Native Check-In Toggling**: For any exempt meeting, `setNativeCheckInEnabled(roomId, false)` is issued to disable native RoomOS no-show cancellation. When the meeting ends, `setNativeCheckInEnabled(roomId, true)` restores the baseline.
 
 ### 5.4 Ad Hoc "Booked from Device" Guard
+
 If `response.Booking.BookedFromDevice === 'True'`, automatic check-in is suppressed because occupants created the meeting directly on the room touch panel; the service awaits the native RoomOS check-in event.
 
 ### 5.5 External Release Observation
+
 When a room transitions to `Free` or `FreeUntil` before its scheduled end time, the service checks whether the release was triggered by its own pending checkout. If not, it emits a structured `[EXTERNAL_RELEASE_OBSERVED]` audit log capturing booking ID, start time, end time, and released status.
 
 ### 5.6 Codec-Local Timezone Midnight Health Scheduling
+
 The service parses each codec's local ISO timezone offset (e.g. `+02:00`), calculates the exact millisecond delay until local midnight on that physical codec, and schedules a midnight health check. If timezone offset is unavailable or invalid, the service flags `CodecTimeUnavailable` and suspends automatic release.
 
 ---
@@ -252,11 +270,13 @@ The service parses each codec's local ISO timezone offset (e.g. `+02:00`), calcu
 To prevent drift between external service memory and physical room states, the system implements a two-tier reconciliation engine:
 
 ### Tier 1: Just-In-Time (JIT) Synchronous Verification Probe
+
 - **Execution Point**: Executed synchronously at the exact moment before a release command is dispatched ($T=0$).
 - **Direct Hardware Verification**: Calls `getPresence(roomId)` and `getAvailability(roomId)` directly.
 - **Fail-Closed Gate**: If the room is `Occupied`, `Unknown`, the booking ID changed, or the call fails/times out, the release is aborted immediately and logged as `ReleaseAbortedPreserved`.
 
 ### Tier 2: Background Drift & Health Sweeper
+
 - **Cadence**: Executes periodically (configurable, e.g. every 15 minutes) and at codec-local midnight.
 - **Functions**:
   1. Detects orphaned room timers where expected events were lost.
@@ -268,22 +288,28 @@ To prevent drift between external service memory and physical room states, the s
 ## 7. Multi-Room Fleet, Operational Safety & Configuration Dashboard
 
 ### 7.1 Room Lifecycle & Maintenance Mode
+
 - The service periodically synchronizes device inventory against Webex Control Hub.
 - Rooms marked `disconnected` or undergoing maintenance are flagged as `Offline`.
 - Any active countdown or warning for an offline room is immediately halted. Automation fails closed.
 
 ### 7.2 Progressive Rollout Roster
+
 Each room record maintains an execution mode:
+
 - `MONITOR_ONLY`: Observes and logs telemetry; executes no prompts, emails, or booking commands.
 - `DRY_RUN`: Simulates countdowns, logs `[DRY RUN - WOULD_DISPLAY_PROMPT]`, `[DRY RUN - WOULD_SEND_EMAIL]`, and `[DRY RUN - WOULD_RELEASE]`; suppresses external commands and live emails.
 - `LIVE`: Full autonomous operation.
 
 ### 7.3 Automated Anomaly Tripwire & Emergency Kill Switch
+
 - **Automated Anomaly Tripwire**: If the fleet-wide cancellation rate exceeds a safety threshold (e.g., >30 cancellations across the fleet within any 5-minute sliding window), the service automatically trips into emergency fail-closed mode and halts all releases.
 - **Instant Kill Switch**: An environment / SSM parameter (`AUTOCANCEL_KILL_SWITCH=true`) evaluated by the engine that stops all cancellation commands instantly without restarting the service.
 
 ### 7.4 Configurable Exemption Engine & Lightweight "Google-Style" Dashboard
+
 The service embeds a lightweight, server-rendered administration and configuration dashboard (`GET /admin`) designed with a clean, Google-style interface (white background, fast tabular results, zero heavy frontend frameworks):
+
 - **Instant Emergency Kill Switch**: Prominent 1-click toggle to pause/resume all automated cancellations across the fleet.
 - **Search Bar**: Instant filtering by room name, room ID, organizer email, or lifecycle status.
 - **Fleet Table**: Displays active rooms, current booking subject/organizer, presence state (`Occupied`/`Empty`), workflow phase (`Idle`, `CountdownScheduled`, `PromptVisible`, `Quarantined`), and remaining countdown seconds.
@@ -301,12 +327,14 @@ The service embeds a lightweight, server-rendered administration and configurati
 ## 8. Deployment & Execution Architecture
 
 ### 8.1 Local Developer Workflow (Laptop)
+
 - Engineer runs `npm run dev`.
 - Service loads `.env.local` with `NOTIFICATION_MODE=longpolling`.
 - Outbound HTTPS long-polling handles Webex device events with zero inbound ports.
 - `MockNotificationDriver` captures warning and cancellation emails, formatting rich previews to the terminal console and recording them in memory for test verification.
 
 ### 8.2 Production Infrastructure on AWS (Terraform-Provisioned)
+
 To keep cloud operations as simple, maintainable, and reliable as possible, the AWS infrastructure is fully codified via Terraform. The architecture is intentionally compute-agnostic, supporting either a containerized service or a dedicated VM depending on organizational hosting standards:
 
 - **Compute Option A (Containerized - AWS ECS Fargate)**:

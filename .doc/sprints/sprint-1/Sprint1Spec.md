@@ -2,9 +2,10 @@
 
 ## Problem Statement
 
-Engineers need to build, run, test, and validate the external Booking Auto Cancellation service directly on their local development laptops within a corporate network environment, without depending on external databases, public inbound IPs, or cloud infrastructure. 
+Engineers need to build, run, test, and validate the external Booking Auto Cancellation service directly on their local development laptops within a corporate network environment, without depending on external databases, public inbound IPs, or cloud infrastructure.
 
 Before deploying to AWS, the team must prove that:
+
 1. The core autocancellation state machine accurately ports the validated codec-native logic.
 2. The Hexagonal driver abstractions (`IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarDriver`) properly decouple domain rules from device SDKs.
 3. The service can ingest live device telemetry via outbound long-polling using Webex Workspace Integrations.
@@ -17,6 +18,7 @@ Before deploying to AWS, the team must prove that:
 Sprint 1 delivers a functional, locally executable Node.js/TypeScript service implementing the core domain engine, the Webex Workspace Integration adapter, and an outbound long-polling ingress transport.
 
 Sprint 1 delivers:
+
 1. Complete TypeScript project scaffolding in the `service` directory with strict typing, configuration loading, and unit/integration test tooling.
 2. The core domain state machine ported directly from the validated macro, managing in-memory room actors with 100% policy parity (including audio chime alerts, prompt restoration, dual presentation, minimum remaining time guard, and ad hoc booking guards).
 3. Hexagonal driver interfaces isolating presence, user interaction, calendar operations, device configuration enforcement, and email notifications.
@@ -62,6 +64,7 @@ Sprint 1 delivers:
 ## Implementation Decisions
 
 ### 1. Project Scaffolding & Configuration
+
 - Set up `package.json`, `tsconfig.json`, ESLint/Prettier, and Vitest in the `service` directory.
 - Define a strongly typed `Config` schema reading from `process.env`:
   - `EMPTY_ROOM_TIMEOUT_MS` (default 10 minutes)
@@ -83,7 +86,9 @@ Sprint 1 delivers:
   - Webex credentials (`WEBEX_CLIENT_ID`, `WEBEX_CLIENT_SECRET`, `WEBEX_REFRESH_TOKEN`, `WEBEX_APP_URL`, `WEBEX_OAUTH_URL`).
 
 ### 2. Hexagonal Domain Interfaces
+
 Define the driver contracts in domain types:
+
 - `IRoomPresenceDriver`: `getPresence(roomId)`, `onPresenceChange(handler)`.
 - `IRoomInteractionDriver`: `hasActionableSurface(roomId)`, `displayWarning(roomId, prompt)`, `displayConfirmation(roomId, prompt)`, `clearWarning(roomId, promptId)`, `restoreDismissedPrompt(roomId, prompt)`, `playAudioAlert(roomId, alert)`, `restoreAudioVolume(roomId)`, `onPromptResponse(handler)`, `onPromptCleared(handler)`.
 - `ICalendarDriver`: `getAvailability(roomId)`, `getBookingDetails(roomId, bookingId)`, `checkIn(roomId, bookingId, trackingData)`, `checkOut(roomId, bookingId, reason)`, `onCheckedIn(handler)`.
@@ -92,6 +97,7 @@ Define the driver contracts in domain types:
 - `IEventIngressTransport`: `start()`, `stop()`, `onNotification(handler)`.
 
 ### 3. Core Room State Machine & Workflow Coordinator
+
 - Port the state machine and policy rules from the codec-native macro to TypeScript classes with full parity:
   - Generational counters (`bookingLifecycleId`, `releaseWorkflowId`) preventing asynchronous races.
   - Startup Check-In Quarantine (`AwaitingStartupCheckIn`).
@@ -101,11 +107,13 @@ Define the driver contracts in domain types:
   - Codec-local timezone offset calculation for midnight health check (`CodecTimeUnavailable` guard).
 
 ### 4. Two-Tier Reconciler, Coalescing & Bounded Recovery
+
 - **50ms Booking Sync Coalescing**: Buffers rapid bursts of `BookedUntil` and `TimeStamp` events.
 - **5-Step Bounded Readiness Recovery**: Retries transient missing metadata on `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` with `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` fallback.
 - **JIT Verification Probe**: Synchronous check at $T=0$ verifying room is empty and booking ID is unaltered before calling `checkOut()`.
 
 ### 5. Webex Workspace Integration Adapter
+
 - Implement `WebexWorkspaceAdapter` wrapping the official `workspace-integrations` SDK.
 - Support xStatus reads (`RoomAnalytics.RoomInUse`, `Bookings.Availability`, `Bookings.Current.Id`, `Peripherals.ConnectedDevice`, `Time.SystemTime`).
 - Support xCommands (`UserInterface.Message.Prompt.*`, `Audio.Volume.*`, `Audio.Sound.*`, `Bookings.CheckIn`, `Bookings.CheckOut`, `Bookings.Get`, `Bookings.List`).
@@ -114,16 +122,19 @@ Define the driver contracts in domain types:
 - Filter out non-controller peripherals (e.g. `RoomScheduler`).
 
 ### 6. Outbound Long-Polling Ingress Transport
+
 - Implement `LongPollingTransport` using `integration.pollData()` from the Webex SDK.
 - Connect to Webex cloud message queue via outbound HTTPS with zero inbound ports.
 - Webhook transport is deferred to a future phase.
 
 ### 7. In-Memory Room Registry & Exemption Engine
+
 - Manage room state machines in memory (`Map<string, RoomWorkflowCoordinator>`).
 - Evaluate exemption rules: duration threshold, VIP organizer email list, and title keywords.
 - Support per-room execution modes (`MONITOR_ONLY`, `DRY_RUN`, `LIVE`).
 
 ### 8. Lightweight "Google-Style" Admin & Configuration Dashboard
+
 - Fastify-embedded `/admin` web interface.
 - 1-click Emergency Kill Switch.
 - Search bar to search rooms by name, room ID, organizer, or status.
@@ -131,6 +142,7 @@ Define the driver contracts in domain types:
 - Web form allowing administrators to view and update timeout durations, long meeting thresholds, VIP organizer exemptions, per-room operational modes, and SMTP relay settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_SECURE`, `NOTIFICATIONS_ENABLED`) without code changes.
 
 ### 9. Corporate SMTP Email Notification Engine
+
 - **Decoupled Outbound Port**: Encapsulated behind `INotificationDriver` and implemented via `SmtpNotificationAdapter` connecting to `outlook.suncorp.com.au:25` as an unauthenticated direct relay (standard for corporate internal smart hosts).
 - **Mandatory Warning Email Precondition (Fail-Closed)**: When the in-room countdown warning prompt is displayed, an urgent warning email is dispatched to the meeting organizer. The service requires successful delivery verification; if SMTP dispatch fails after immediate retries, the cancellation workflow is aborted and the booking is preserved.
 - **Dynamic Timing & Local Clock Presentation**: The warning email dynamically calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (never hardcoded 5 minutes) and displays the release time in the codec's local clock timezone.
@@ -144,6 +156,7 @@ Define the driver contracts in domain types:
 ## Testing Decisions
 
 ### 1. Unit Testing with Mock Drivers
+
 - Use Vitest with fake timers (`vi.useFakeTimers()`).
 - Create `MockPresenceDriver`, `MockInteractionDriver`, `MockCalendarDriver`, `MockDeviceConfigDriver`, and `MockNotificationDriver`.
 - Test scenarios:
@@ -164,6 +177,7 @@ Define the driver contracts in domain types:
   15. Dry-Run Suppression (simulates all steps, confirms no checkout command sent and real emails suppressed with structured log emitted).
 
 ### 2. Integration Testing with Recorded Webex Payloads
+
 - Test `LongPollingTransport` and event dispatching against serialized real-world Webex notification JSON payloads.
 
 ---

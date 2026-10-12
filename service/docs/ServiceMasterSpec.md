@@ -2,9 +2,10 @@
 
 ## Problem Statement
 
-Enterprise organizations face severe meeting room scarcity caused by "ghost bookings" and "no-shows"—calendar reservations where the room remains booked on Microsoft Exchange, but nobody physically occupies the space. 
+Enterprise organizations face severe meeting room scarcity caused by "ghost bookings" and "no-shows"—calendar reservations where the room remains booked on Microsoft Exchange, but nobody physically occupies the space.
 
 While a codec-native Cisco RoomOS macro previously solved this for individual video devices, operating on-device macros across 800 meeting spaces presents significant operational challenges:
+
 1. Macro deployment, updates, and troubleshooting require pushing and maintaining scripts across hundreds of individual room codecs.
 2. The logic is strictly coupled to Cisco's proprietary on-device xAPI environment, preventing the organization from managing non-Cisco meeting rooms (e.g., Poly, Neat, Logitech, or generic sensor-equipped spaces).
 3. Centralized observability, fleet-wide safety controls, progressive rollout rings, and emergency global kill-switches cannot be coordinated from independent, isolated on-device macro scripts.
@@ -18,6 +19,7 @@ Enterprise IT collaboration teams need a centralized, vendor-agnostic external s
 The solution is an external, modular Node.js/TypeScript backend service that connects to room hardware and calendar systems through a Hexagonal (Ports and Adapters) architecture.
 
 The service:
+
 1. Ingests occupancy telemetry, calendar availability, and in-room user interactions via an outbound long-polling Ingress Transport (zero inbound open ports, secure for private networks and local developer workstations), with webhook support deferred to a future phase.
 2. Models every managed meeting room as an independent Finite State Machine actor in memory, enforcing 100% policy parity with the codec-native baseline (No-Show Release, Early Departure Release, Automatic Check-In, and Long-Meeting Exemptions).
 3. Protects ongoing meetings through a mandatory Startup Check-In Quarantine upon service restarts.
@@ -76,50 +78,61 @@ The service:
 ## Implementation Decisions
 
 ### 1. Hexagonal Modular Architecture
+
 The service is structured into four decoupled layers:
+
 - **Ingress Layer**: Ingests device telemetry and events. Encapsulated behind an ingress interface that abstracts the transport protocol (`IEventIngressTransport`).
 - **Core Domain Layer**: Contains the room actor workflow coordinator, state machines, safety guards, classification logic, and reconcilers. Contains zero dependencies on external transport or vendor SDKs.
 - **Port Layer**: Defines outbound contracts for hardware presence telemetry (`IRoomPresenceDriver`), in-room user prompt interactions (`IRoomInteractionDriver`), calendar reservation commands (`ICalendarDriver`), device configuration baselines (`IDeviceConfigDriver`), and end-user email communications (`INotificationDriver`).
 - **Adapter Layer**: Implements the port contracts for specific platforms (Phase 1: Cisco Webex Workspace Integration for hardware/calendar, and Corporate SMTP relay for email notifications).
 
 ### 2. Outbound Long-Polling Ingress Transport
+
 To accommodate corporate development laptop security constraints alongside private cloud hosting:
+
 - Ingress uses persistent outbound HTTPS long-polling to the Webex Cloud message queue.
 - Requires zero inbound network ports, zero public IP, and zero TLS certificate management.
 - Inbound webhook support is deferred to a future phase.
 
 ### 3. In-Memory Finite State Machine (FSM) Actors
+
 - Each room is managed by an isolated, in-memory Finite State Machine actor.
 - State transitions strictly mirror the validated codec-native macro logic: `Idle`, `Quarantined`, `ActiveMeeting`, `CountdownScheduled`, `PromptVisible`, `ValidatingJIT`, and `Released`.
 - Memory footprint across 800 room actors is under 20 MB RAM, eliminating the need for an external Redis/database cluster.
 
 ### 4. Startup Quarantine Guard (`AwaitingStartupCheckIn`)
+
 - When the service initializes or restarts, it fetches the list of active bookings across the fleet.
 - Any room with a meeting already in progress is placed into `Quarantined` state.
 - Quarantined meetings are blocked from automatic no-show release, countdowns, warning prompts, and checkouts.
 - Quarantine can only be cleared when a fresh, matching check-in event is authoritatively observed from the room.
 
 ### 5. Two-Tier Reconciler Engine
+
 - **Tier 1 (Just-In-Time Verification Probe)**: Executed synchronously at $T=0$ immediately before any checkout command is issued. Queries the physical room presence and calendar availability in real time. If the room is occupied, status is unknown, or the booking changed, checkout is aborted and the booking is preserved.
 - **Tier 2 (Background Drift & Health Sweeper)**: Runs periodically (e.g. every 15 minutes) and at codec-local midnight to identify orphaned room timers, detect devices that went offline, and re-verify presence sensor configurations.
 
 ### 6. Actionable Surface Authorization Guard
+
 - Automatic release is strictly blocked unless the room possesses a verified, actionable interactive surface capable of capturing user prompt responses (e.g. Touch 10, Room Navigator, or Desk Pro interactive display).
 - Rooms equipped with informational-only displays or lacking connected touch controllers are classified as non-actionable; automatic checkout is inhibited.
 - `RoomScheduler` Navigators (outside room panels) are strictly filtered out and never receive warning prompts.
 
 ### 7. Long-Meeting & Group/VIP Exemption Engine
+
 - **Duration Threshold**: Meetings with a verified duration strictly greater than 120 minutes (configurable via `LONG_MEETING_EXEMPTION_THRESHOLD_MS`) are classified as `Long` and blocked from autocancellation.
 - **VIP Organizers & Groups**: Configurable list of organizer email addresses (`EXEMPT_ORGANIZERS`) and meeting title keywords (`EXEMPT_TITLE_KEYWORDS`) that automatically block autocancellation.
 - **Unclassifiable Meetings**: Malformed or unverified meeting details default to `Blocked` with reason `UnclassifiableMeeting`.
 
 ### 8. Progressive Rollout & Safety Controls
+
 - **Per-Room Mode**: Each room configuration specifies `MONITOR_ONLY`, `DRY_RUN`, or `LIVE`.
 - **Dry-Run Emulation**: Executes full countdown, classification, and prompt tracking, but suppresses physical prompt displays, live email dispatches, and checkout commands, emitting structured simulation logs (`[DRY RUN - WOULD_SEND_EMAIL]`, `[DRY RUN - WOULD_RELEASE]`).
 - **Anomaly Tripwire**: Tracks global cancellations across a sliding 5-minute window; automatically trips into safe hold if cancellations exceed 30 within that window.
 - **Emergency Kill Switch**: Evaluates a dynamic flag (`AUTOCANCEL_KILL_SWITCH`) that halts all booking-changing actions instantly.
 
 ### 9. Target Production Infrastructure on AWS (Terraform-Provisioned)
+
 - Designed for maximum operational simplicity and reliability in AWS, fully codified in Terraform with support for flexible compute:
   - **Option A (Containerized - AWS ECS Fargate)**: Single task definition running in private subnets, managed by an ECS Service (Desired=1), with zero OS patching or host maintenance.
   - **Option B (Virtual Machine - AWS EC2 RHEL 9)**: Single instance (`t4g.small` or `t3.small`) managed by an Auto Scaling Group (Min=1, Max=1, Desired=1) across two Availability Zones, supervised natively by Linux `systemd` (`Restart=always`).
@@ -128,21 +141,25 @@ To accommodate corporate development laptop security constraints alongside priva
 - **Observability**: AWS CloudWatch Agent / FireLens streaming structured JSON logs to CloudWatch Log Groups with metric alarms.
 
 ### 10. In-Room Audio Chimes, Dual Presentation & Dismissed Prompt Restoration
+
 - When the warning prompt appears, the service overrides volume to 70%, plays the `Announcement` sound, holds for 4 seconds, restores volume to default, and repeats every 60 seconds.
 - Displays actionable prompt on touch controllers and informational text on room monitors (OSD).
 - Uses `INITIAL` text for the first warning and `REPEATED` text if a user previously kept the booking but the room remains empty.
 - Automatically re-displays the prompt if dismissed without selection (via user swipe or `Prompt.Cleared`) for the remaining warning duration.
 
 ### 11. Native Check-In Window Enforcement & Serialized Toggling
+
 - Enforces `Bookings.CheckIn.WindowDuration: 60` to ensure RoomOS native no-show timers never race ahead of the service.
 - Actively serializes writes to `Bookings.CheckIn.Enabled` through a FIFO promise queue: sets `False` for long/exempt meetings to protect them from native RoomOS release, and restores `True` when the meeting ends or room is free.
 
 ### 12. Bounded Readiness Recovery & Booking Sync Coalescing
+
 - Implements a 50ms coalescing guard (`BOOKING_SYNC_COALESCE_DELAY_MS`) to buffer rapid bursts of `BookedUntil` and `TimeStamp` events.
 - Executes bounded readiness recovery on delays of `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` with `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` fallback if transient room metadata is unavailable.
 - Skips autocancellation if remaining meeting duration is $\le 12$ minutes (`EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS`).
 
 ### 13. Lightweight "Google-Style" Admin & Configuration Dashboard
+
 - Fastify-embedded administrative web interface (`GET /admin`) with clean, minimalist Google-style styling.
 - Prominent 1-click Emergency Kill Switch.
 - Search box for filtering rooms by name, ID, organizer, or status.
@@ -150,6 +167,7 @@ To accommodate corporate development laptop security constraints alongside priva
 - Web form allowing administrators to view and update timeout durations, long meeting thresholds, VIP organizer exemptions, per-room operational modes, and SMTP relay settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_SECURE`, `NOTIFICATIONS_ENABLED`) without code changes.
 
 ### 14. Corporate SMTP Email Notification Engine
+
 - **Decoupled Outbound Port**: Encapsulated behind `INotificationDriver` and implemented via `SmtpNotificationAdapter` connecting to `outlook.suncorp.com.au:25` as an unauthenticated direct relay (standard for corporate internal smart hosts).
 - **Mandatory Warning Email Precondition (Fail-Closed)**: When the in-room countdown warning prompt is displayed, an urgent warning email is dispatched to the meeting organizer. The service requires successful delivery verification; if SMTP dispatch fails after immediate retries, the cancellation workflow is aborted and the booking is preserved to prevent unannounced releases.
 - **Dynamic Timing & Local Clock Presentation**: The warning email dynamically calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (never hardcoded 5 minutes) and displays the release time in the codec's local clock timezone.
@@ -163,16 +181,19 @@ To accommodate corporate development laptop security constraints alongside priva
 ## Testing Decisions
 
 ### 1. Behavior-Only Testing Philosophy
+
 - Tests must verify external domain behavior, state transitions, and safety invariant enforcement.
 - Tests must never test internal implementation details, private variables, or specific loop constructs.
 - A test is considered valid only if it asserts that unsafe cancellations are blocked and valid cancellations proceed under exact, verified conditions.
 
 ### 2. Testing Seams
+
 - **Primary Domain Seam**: The domain engine will be tested by driving it through its input events (presence changes, calendar updates, prompt responses) and asserting on calls made to mock implementations of `IRoomPresenceDriver`, `IRoomInteractionDriver`, `ICalendarDriver`, and `INotificationDriver`.
 - **Ingress Seam**: Ingress transports will be tested by delivering synthetic Webex JSON notification payloads and verifying correct dispatch to the domain engine.
 - **Time Virtualization**: All timers and countdowns will be tested using virtualized/mock clocks to verify warning windows and empty-room timeouts deterministically in milliseconds without real-world delays.
 
 ### 3. Core Test Scenarios
+
 - **No-Show Release Lifecycle**: Empty room triggers countdown, warning prompt displays, warning email dispatches to organizer, room remains empty, JIT probe confirms vacancy, checkout is issued, cancellation email dispatches.
 - **User Keep Booking**: Warning prompt displays; user selects "Keep Booking"; prompt dismisses; meeting is preserved; countdown resets safely; no duplicate warning email sent on subsequent prompt restoration.
 - **User Early Checkout**: User selects "Check Out"; confirmation prompt displays; user confirms; checkout is executed immediately.
