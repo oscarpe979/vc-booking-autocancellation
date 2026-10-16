@@ -24,6 +24,5 @@ Thumbs.db
 *.swo
 
 # Dev
-.doc/*
-!.doc/sprints/
+.doc/
 .github/
