@@ -33,6 +33,8 @@ flowchart LR
         direction TB
         
         FleetConfig["<b>Dynamic Configuration</b><br/>Timeouts, VIP exemptions & SMTP settings"]:::config
+
+        FleetRoster["<b>Fleet Roster</b><br/>Room enrollment & modes<br/>Roster gate (DISABLED by default)"]:::config
         
         RoomActor["<b>Room Workflow Coordinator</b><br/><i>(Aggregate Root)</i><br/>Tracks room lifecycle & active timers"]:::aggregate
 
@@ -47,6 +49,8 @@ flowchart LR
         P_Calendar["<b>ICalendarDriver</b><br/>CheckIn & CheckOut actions"]:::port
         P_Config["<b>IDeviceConfigDriver</b><br/>Room sensor settings"]:::port
         P_Notify["<b>INotificationDriver</b><br/>Warning & cancellation emails"]:::port
+        P_Inventory["<b>IFleetInventoryDriver</b><br/>Control Hub device discovery (read-only)"]:::port
+        P_Store["<b>IFleetConfigStore</b><br/>Roster, settings & audit log"]:::port
     end
 
     %% 4. ADAPTERS (CENTER-RIGHT)
@@ -54,6 +58,7 @@ flowchart LR
         direction TB
         WebexAdapter["<b>Webex Workspace Adapter</b><br/>Cisco RoomOS device integration"]:::adapter
         SmtpAdapter["<b>SMTP Notification Adapter</b><br/>Corporate email relay integration"]:::adapter
+        StoreAdapter["<b>DynamoDB Config Store Adapter</b><br/>JSON file adapter for local dev"]:::adapter
     end
 
     %% 5. EXTERNAL SYSTEMS (RIGHT)
@@ -63,13 +68,20 @@ flowchart LR
         Ext_Exchange["<b>Microsoft Exchange</b><br/>Room calendars"]:::external
         Ext_Smtp["<b>Corporate SMTP Relay</b><br/>outlook.suncorp.com.au:25"]:::external
         Ext_Users["<b>Meeting Organizers</b><br/>User inboxes"]:::external
+        Ext_ControlHub["<b>Webex Control Hub</b><br/>Workspace & device inventory"]:::external
+        Ext_Dynamo["<b>AWS DynamoDB</b><br/>Rooms, settings & audit tables"]:::external
     end
 
     %% CLEAN UNIDIRECTIONAL FLOWS (LEFT TO RIGHT)
-    IngressPoll -->|"Room Events"| RoomActor
+    IngressPoll -->|"Room Events"| FleetRoster
+    FleetRoster -->|"Enrolled rooms only"| RoomActor
     IngressAdmin -->|"Config Updates"| FleetConfig
+    IngressAdmin -->|"Enroll / Mode Changes"| FleetRoster
     FleetConfig -->|"Applies Rules"| RoomActor
     RoomActor -->|"Enforces"| RulesEngine
+    FleetRoster --> P_Inventory
+    FleetRoster --> P_Store
+    FleetConfig --> P_Store
 
     %% ACTOR DISPATCHES THROUGH DOMAIN PORTS
     RoomActor --> P_Presence
@@ -84,13 +96,17 @@ flowchart LR
     P_Calendar --> WebexAdapter
     P_Config --> WebexAdapter
     P_Notify --> SmtpAdapter
+    P_Inventory --> WebexAdapter
+    P_Store --> StoreAdapter
 
     %% ADAPTERS CONNECT TO EXTERNAL SYSTEMS
     WebexAdapter -->|"xCommand / xConfig"| Ext_Cisco
     Ext_Cisco -->|"xStatus / xEvent"| WebexAdapter
     WebexAdapter --> Ext_Exchange
+    WebexAdapter -->|"Device list (read-only)"| Ext_ControlHub
     SmtpAdapter --> Ext_Smtp
     Ext_Smtp --> Ext_Users
+    StoreAdapter -->|"HTTPS via VPC endpoint"| Ext_Dynamo
 ```
 
 ---
@@ -101,7 +117,7 @@ flowchart LR
 
 - **`LongPollingTransport`**: Outbound HTTPS 443 persistent connection to Webex Cloud integration queues. Ingests occupancy telemetry (`RoomAnalytics.RoomInUse`), calendar availability (`Bookings.Availability`), booking details, and touch controller user interactions without requiring inbound firewall pinholes, public DNS, or reverse proxies.
 - **`AdminDashboardController`**: Fastify-embedded `/admin` web interface providing a 1-click fleet Emergency Kill Switch, real-time room search, and live configuration updates for timeouts, VIP lists, and SMTP relay settings.
-- **`ConfigSources`**: Seeds baseline configurations at startup from AWS SSM Parameter Store (`SecureString`) or `.env.local`, which are dynamically overridable at runtime via the dashboard.
+- **`ConfigSources`**: Secrets (Webex credentials) come from AWS SSM Parameter Store (`SecureString`) or `.env.local`. All admin-controlled state (the roster, room modes, the kill switch, timings, exemptions, and SMTP settings) is loaded from and persisted to the durable fleet configuration store (DynamoDB in AWS, a JSON file on a laptop), so dashboard changes survive restarts. The `AUTOCANCEL_KILL_SWITCH` parameter remains as an independent, second kill-switch source ([ServiceLowLevelDesign.md §8](ServiceLowLevelDesign.md)).
 
 ### 3.2 Dynamic Fleet Configuration Model
 
@@ -109,7 +125,15 @@ flowchart LR
 - **Room Policy Parity Settings** (same meaning and defaults as the macro `CONFIG`): `EARLY_DEPARTURE_RELEASE_ENABLED` (default `false`), `NATIVE_CHECK_IN_WINDOW_MINUTES` (default 60; must exceed the effective release horizon), and `ULTRASOUND_SENSOR_ENABLED` (default `false`; writes `PeoplePresence.Input.Ultrasound` `On`/`Off`).
 - **Exemption Rules**: `LONG_MEETING_EXEMPTION_THRESHOLD_MS` (120m), `EXEMPT_ORGANIZERS` (VIP email list), and `EXEMPT_TITLE_KEYWORDS` (e.g. "Board", "Executive", "Confidential").
 - **SMTP & Notification Settings**: `NOTIFICATIONS_ENABLED` (boolean), `SMTP_HOST` (`outlook.suncorp.com.au`), `SMTP_PORT` (25), `SMTP_FROM`, and `SMTP_SECURE`.
-- **Safety & Rollout Modes**: `AUTOCANCEL_KILL_SWITCH`, fleet anomaly spike threshold (>30 releases / 5 min), and per-room operational mode (`MONITOR_ONLY`, `DRY_RUN`, `LIVE`).
+- **Safety & Rollout Modes**: `AUTOCANCEL_KILL_SWITCH`, fleet anomaly spike threshold (>30 releases / 5 min), and per-room operational mode (`DISABLED`, `MONITOR_ONLY`, `DRY_RUN`, `LIVE`).
+
+### 3.2a Fleet Roster (Enrollment Authority)
+
+- Owns the answer to "which rooms does this service manage, and how". Every workspace discovered in Control Hub gets a roster entry in `DISABLED` mode. A `DISABLED` room has no actor, and all of its events are discarded at the roster gate.
+- Only an administrator can promote a room: `DISABLED → MONITOR_ONLY → DRY_RUN → LIVE` (or `DISABLED → DRY_RUN`). `LIVE` is reachable only from `DRY_RUN`, after a readiness report and an explicit, audited confirmation. The system may only demote a room, for example to `DISABLED` when its managed device is replaced.
+- Binds each workspace to exactly one managed device. A replaced or ambiguous device is never touched until an admin re-enrolls it.
+- Enforces the roster gate on both ingress events and outbound device commands.
+- Details: [ServiceLowLevelDesign.md §5.7, §7.1 and §8](ServiceLowLevelDesign.md).
 
 ### 3.3 Aggregate Root: RoomActor (`RoomWorkflowCoordinator`)
 
@@ -140,8 +164,11 @@ All four gates must evaluate to **Clear** before any automatic room release comm
 - **`ICalendarDriver`**: Queries booking availability and executes `checkIn` and `checkOut`.
 - **`IDeviceConfigDriver`**: Enforces baseline presence configurations and serializes native check-in toggles.
 - **`INotificationDriver`**: Dispatches warning alerts and differentiated cancellation receipts (No-Show vs Early Departure).
+- **`IFleetInventoryDriver`**: Lists workspaces and devices visible in Control Hub. Read-only; never issues device xAPI calls.
+- **`IFleetConfigStore`**: Durably loads and conditionally writes the roster and fleet settings, and appends to the audit log.
 
 ### 3.7 Driven Infrastructure Adapters
 
-- **`WebexWorkspaceAdapter`**: Implements presence, interaction, calendar, and config driver contracts against Cisco RoomOS endpoints via the Webex xAPI SDK.
+- **`WebexWorkspaceAdapter`**: Implements the presence, interaction, calendar, config, and inventory driver contracts against Cisco RoomOS endpoints and Control Hub via the Webex SDK. It refuses commands to devices the roster gate does not allow.
 - **`SmtpNotificationAdapter`**: Connects to `outlook.suncorp.com.au:25` as an unauthenticated direct relay to deliver responsive multipart HTML and plain-text emails to meeting organizers.
+- **`DynamoFleetConfigStore`**: Implements `IFleetConfigStore` against three DynamoDB tables (rooms, settings, append-only audit) using conditional writes. `JsonFileFleetConfigStore` implements the same port on a laptop.

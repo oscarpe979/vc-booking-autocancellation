@@ -72,6 +72,10 @@ The service:
 37. As a meeting organizer whose room was cancelled, I want to receive a cancellation notice email detailing the room name, scheduled time, and whether it was released due to a No-Show or an Early Departure, so that I have a clear record of why the space was freed.
 38. As an enterprise IT collaboration administrator, I want to configure the corporate SMTP host, port, sender email, and notification enable/disable switch from the `/admin` dashboard, so that mail delivery settings can be updated at runtime without redeploying code.
 39. As a cloud operations engineer, I want the AWS production environment fully codified in Terraform with support for either an AWS ECS Fargate container or an EC2 RHEL 9 instance in private subnets, so that infrastructure provisioning is repeatable, simple to manage, and secure.
+40. As an enterprise IT collaboration administrator, I want workspaces newly added to Control Hub to be recorded as `DISABLED`, with all of their events discarded, so that no room is ever enrolled in autocancellation without my explicit decision.
+41. As an enterprise IT collaboration administrator, I want to see which workspaces were discovered but not enrolled, and which managed devices went missing or were replaced, so that I know exactly what a fleet change means for the service.
+42. As an enterprise IT collaboration administrator, I want room enrollment, modes, the kill switch, and all settings to survive service restarts, with an audit trail of who changed what, so that a restart never silently resumes automation or forgets a decision.
+43. As an enterprise IT collaboration administrator, I want promotion to `LIVE` to show a readiness report and require my explicit confirmation, so that a room goes live only on my judgement.
 
 ---
 
@@ -83,8 +87,8 @@ The service is structured into four decoupled layers:
 
 - **Ingress Layer**: Ingests device telemetry and events. Encapsulated behind an ingress interface that abstracts the transport protocol (`IEventIngressTransport`).
 - **Core Domain Layer**: Contains the room actor workflow coordinator, state machines, safety guards, classification logic, and reconcilers. Contains zero dependencies on external transport or vendor SDKs.
-- **Port Layer**: Defines outbound contracts for hardware presence telemetry (`IRoomPresenceDriver`), in-room user prompt interactions (`IRoomInteractionDriver`), calendar reservation commands (`ICalendarDriver`), device configuration baselines (`IDeviceConfigDriver`), and end-user email communications (`INotificationDriver`).
-- **Adapter Layer**: Implements the port contracts for specific platforms (Phase 1: Cisco Webex Workspace Integration for hardware/calendar, and Corporate SMTP relay for email notifications).
+- **Port Layer**: Defines outbound contracts for hardware presence telemetry (`IRoomPresenceDriver`), in-room user prompt interactions (`IRoomInteractionDriver`), calendar reservation commands (`ICalendarDriver`), device configuration baselines (`IDeviceConfigDriver`), end-user email communications (`INotificationDriver`), read-only Control Hub discovery (`IFleetInventoryDriver`), and durable fleet configuration (`IFleetConfigStore`).
+- **Adapter Layer**: Implements the port contracts for specific platforms (Phase 1: Cisco Webex Workspace Integration for hardware, calendar, and inventory; Corporate SMTP relay for email notifications; DynamoDB for the fleet configuration store, with a JSON-file adapter for local development).
 
 ### 2. Outbound Long-Polling Ingress Transport
 
@@ -98,7 +102,7 @@ To accommodate corporate development laptop security constraints alongside priva
 
 - Each room is managed by an isolated, in-memory Finite State Machine actor.
 - State transitions strictly mirror the validated codec-native macro logic: `Idle`, `Quarantined`, `ActiveMeeting`, `CountdownScheduled`, `PromptVisible`, `ValidatingJIT`, and `Released`.
-- Memory footprint across 800 room actors is under 20 MB RAM, eliminating the need for an external Redis/database cluster.
+- Memory footprint across 800 room actors is under 20 MB RAM. Room runtime state (phases, timers, prompt ownership) is never persisted, matching the macro; a restart is made safe by startup quarantine. Only admin-controlled state is durable (see Decision 15).
 
 ### 4. Startup Quarantine Guard (`AwaitingStartupCheckIn`)
 
@@ -126,10 +130,13 @@ To accommodate corporate development laptop security constraints alongside priva
 
 ### 8. Progressive Rollout & Safety Controls
 
-- **Per-Room Mode**: Each room configuration specifies `MONITOR_ONLY`, `DRY_RUN`, or `LIVE`.
+- **Per-Room Mode**: Each room roster entry specifies `DISABLED` (the default for every discovered room), `MONITOR_ONLY`, `DRY_RUN`, or `LIVE`. Only an administrator promotes a room: `DISABLED → MONITOR_ONLY → DRY_RUN → LIVE`, or `DISABLED → DRY_RUN`. `LIVE` is reachable only from `DRY_RUN`; the time spent in `DRY_RUN` is the administrator's judgement.
+- **Disabled Rooms**: A `DISABLED` room has no actor. Every event from it is discarded and nothing is ever sent to it.
+- **Monitor-Only Emulation**: A permanent, strictly read-only mode for sensitive rooms. It sends no commands, emails, or device configuration writes, and runs no release workflow (real or simulated). It records utilization telemetry only, and leaves the room's native RoomOS baseline untouched. It is distinct from `DRY_RUN`, which is a temporary rollout rehearsal that does configure the device.
+- **Mode Transitions**: Moving a room into `DRY_RUN` or `LIVE` quarantines any meeting already in progress, exactly as at service startup. Moving a room down to `MONITOR_ONLY` or `DISABLED` cancels any active workflow, clears the service's prompts, and restores the room's native CheckIn setting to the baseline recorded before the service first changed it. After that, the room is read-only (`MONITOR_ONLY`) or ignored (`DISABLED`).
 - **Dry-Run Emulation**: Executes full countdown, classification, and prompt tracking, but suppresses physical prompt displays, live email dispatches, and checkout commands, emitting structured simulation logs (`[DRY RUN - WOULD_SEND_EMAIL]`, `[DRY RUN - WOULD_RELEASE]`).
 - **Anomaly Tripwire**: Tracks global cancellations across a sliding 5-minute window; automatically trips into safe hold if cancellations exceed 30 within that window.
-- **Emergency Kill Switch**: Evaluates a dynamic flag (`AUTOCANCEL_KILL_SWITCH`) that halts all booking-changing actions instantly.
+- **Emergency Kill Switch**: Halts all booking-changing actions instantly. It is active if either the persisted dashboard value or the `AUTOCANCEL_KILL_SWITCH` parameter is true. It survives restarts; activation never waits on persistence, while deactivation requires it. A tripped tripwire is likewise persisted until an administrator resets it.
 
 ### 9. Target Production Infrastructure on AWS (Terraform-Provisioned)
 
@@ -138,6 +145,7 @@ To accommodate corporate development laptop security constraints alongside priva
   - **Option B (Virtual Machine - AWS EC2 RHEL 9)**: Single instance (`t4g.small` or `t3.small`) managed by an Auto Scaling Group (Min=1, Max=1, Desired=1) across two Availability Zones, supervised natively by Linux `systemd` (`Restart=always`).
 - **Private Subnets & Egress**: Runs strictly inside private VPC subnets with outbound HTTPS 443 egress to Webex Cloud and outbound TCP 25 egress routed to `outlook.suncorp.com.au` via corporate network connections.
 - **Zero Plaintext Credentials**: Credentials and tokens fetched at startup from AWS SSM Parameter Store (`SecureString`) via IAM roles.
+- **Fleet Configuration Store**: Three on-demand DynamoDB tables (rooms, settings, append-only audit), with point-in-time recovery and deletion protection, reached through a VPC gateway endpoint. A DynamoDB lease ensures a single active service instance.
 - **Observability**: AWS CloudWatch Agent / FireLens streaming structured JSON logs to CloudWatch Log Groups with metric alarms.
 
 ### 10. In-Room Audio Chimes, Dual Presentation & Dismissed Prompt Restoration
@@ -163,6 +171,7 @@ To accommodate corporate development laptop security constraints alongside priva
 ### 13. Lightweight "Google-Style" Admin & Configuration Dashboard
 
 - Fastify-embedded administrative web interface (`GET /admin`) with clean, minimalist Google-style styling.
+- **Interim access control:** the dashboard binds to `127.0.0.1` only and is protected by a single shared admin password (`ADMIN_DASHBOARD_PASSWORD`), with session cookies, CSRF protection, and login rate limiting. It refuses to start without a password. Per-user SSO and roles are deferred.
 - Prominent 1-click Emergency Kill Switch.
 - Search box for filtering rooms by name, ID, organizer, or status.
 - Real-time fleet status table showing lifecycle phase, presence, and countdown timer.
@@ -177,6 +186,22 @@ To accommodate corporate development laptop security constraints alongside priva
 - **Differentiated Cancellation Receipts**: Upon successful automatic calendar release, dispatches a conclusive receipt explicitly distinguishing **No-Show Release** from **Early Departure Release**. A user-confirmed checkout from the room controller sends no receipt.
 - **Template Architecture**: Multipart MIME (HTML + RFC-compliant plain text) with corporate styling, meeting title, room location, and clear action guidance.
 - **Local Development**: Emulated via `MockNotificationDriver` with formatted terminal logging and in-memory capture for test assertions.
+
+### 15. Durable Fleet Configuration Store (DynamoDB)
+
+- Admin-controlled state (the roster, room modes, the kill switch, the tripped tripwire, timings, exemptions, and SMTP settings) and an append-only audit log are persisted behind the `IFleetConfigStore` port. They are implemented by `DynamoFleetConfigStore` in AWS and `JsonFileFleetConfigStore` on a laptop, so local development still needs no database.
+- Every change is a conditional (versioned) write that is persisted before it takes effect, and is audited with who, when, before, and after.
+- **Fail closed:** if the store cannot be read at startup, the service manages no room until it loads, and it never falls back to defaults. During a runtime outage, the service keeps the last-known-good state and rejects dashboard writes, except kill-switch activation.
+- A DynamoDB lease guarantees that only one service instance drives rooms at a time.
+- Details: [ServiceLowLevelDesign.md §8](ServiceLowLevelDesign.md).
+
+### 16. Fleet Roster & Room Enrollment
+
+- The roster is the sole authority on which rooms are managed. **Nothing is enrolled automatically.** The Control Hub inventory sync (startup plus every 15 minutes, read-only) records each new workspace as `DISABLED` and audits it. Adding 10 workspaces to Control Hub therefore produces 10 `DISABLED` roster entries and a dashboard notice, and nothing else.
+- A roster gate discards events from `DISABLED`, unrostered, missing, or mismatched devices. The Webex adapter also refuses commands to them.
+- Each workspace is bound to exactly one managed device. A replaced device is demoted to `DISABLED` (`DeviceMismatch`); a workspace with several booking-capable devices waits for an admin to choose one (`AmbiguousWorkspace`). The system may demote a room but never promotes one.
+- `DRY_RUN → LIVE` shows a readiness report (actionable surface, presence telemetry, codec timezone, configuration writes, dry-run evidence) and requires an explicit, audited confirmation.
+- Recommended second safeguard: activate the Workspace Integration only for the Control Hub locations in scope. Commands and status reads to devices in other locations then fail with `403`. Configuration writes and the device list remain org-wide, so the roster gate stays the primary control.
 
 ---
 
@@ -206,6 +231,11 @@ To accommodate corporate development laptop security constraints alongside priva
 - **JIT Verification Abort**: Room is empty throughout countdown, but person enters at $T=0$ before checkout; JIT probe detects presence; checkout command is suppressed; booking preserved.
 - **Notification Failure Fail-Closed**: Warning prompt displays, but mock notification driver throws delivery failure; cancellation is aborted; booking is preserved.
 - **Tripwire Activation**: Simulated burst of 31 cancellations within 5 minutes causes engine to freeze subsequent releases.
+- **New Workspace Discovery**: The inventory returns new workspaces; each becomes a `DISABLED` roster entry; their events are discarded; no command or configuration write reaches them.
+- **Device Replacement**: The managed device ID changes in a workspace; the room is demoted to `DISABLED` with `DeviceMismatch`; the new device is never touched.
+- **Store Unavailable at Startup**: No actor is registered, every event is discarded, and no device is touched until the store loads.
+- **Kill Switch Survives Restart**: Activate the kill switch, restart the service; it is still active and no release occurs.
+- **Mode Promotion Quarantine**: Promoting a room with a meeting in progress to `DRY_RUN` or `LIVE` quarantines that meeting.
 
 ---
 

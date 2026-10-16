@@ -68,6 +68,13 @@ For the comprehensive visual Domain-Driven Design (DDD) architecture model detai
                                                    |
                                                    v
 +----------------------------------------------------------------------------------------------------+
+|                                         FLEET ROSTER GATE                                          |
+|           Discards every event from DISABLED, unrostered, missing or mismatched devices            |
+|           Roster & settings from IFleetConfigStore; inventory from IFleetInventoryDriver           |
++----------------------------------------------------------------------------------------------------+
+                                                   |
+                                                   v
++----------------------------------------------------------------------------------------------------+
 |                                      CORE DOMAIN ENGINE                                            |
 |                                                                                                    |
 |     +-----------------------------------------------------------------------------------------+    |
@@ -83,13 +90,14 @@ For the comprehensive visual Domain-Driven Design (DDD) architecture model detai
 |                                                |                                                   |
 |                                                v                                                   |
 |                                     DOMAIN PORTS (SEAMS)                                           |
-|                     +------------------+------------------+------------------+                    |
-|                     |                  |                  |                  |                    |
-|                     v                  v                  v                  v                    |
-|            IRoomPresenceDriver  IRoomInteraction  ICalendarDriver     INotificationDriver         |
-|            (Occupancy)          (In-Room UI)      (Bookings/CheckIn)  (Email Notifications)       |
-|                     |                  |                  |                  |                    |
-+---------------------|------------------|------------------|------------------|--------------------+
+|                     +------------------+------------------+------------------+                     |
+|                     |                  |                  |                  |                     |
+|                     v                  v                  v                  v                     |
+|            IRoomPresenceDriver  IRoomInteraction  ICalendarDriver     INotificationDriver          |
+|            (Occupancy)          (In-Room UI)      (Bookings/CheckIn)  (Email Notifications)        |
+|            + IDeviceConfigDriver, IFleetInventoryDriver (read-only), IFleetConfigStore (durable)   |
+|                     |                  |                  |                  |                     |
++---------------------|------------------|------------------|------------------|---------------------+
                       |                  |                  |                  |
                       v                  v                  v                  v
 +----------------------------------------------------------------------------------------------------+
@@ -97,7 +105,7 @@ For the comprehensive visual Domain-Driven Design (DDD) architecture model detai
 |                                                                                                    |
 |     +-----------------------------------------------------------------------------------------+    |
 |     |                         Webex Workspace Integration Adapter                             |    |
-|     |              (Implements Presence, Interaction, Calendar & Config Drivers)              |    |
+|     |        (Implements Presence, Interaction, Calendar, Config & Inventory Drivers)         |    |
 |     |   * xStatus: RoomAnalytics.RoomInUse, Bookings.Availability, Bookings.Current.Id        |    |
 |     |   * xStatus: Peripherals.ConnectedDevice (TouchPanel filter), Time.SystemTime           |    |
 |     |   * xCommand: UserInterface.Message.Prompt.*, Audio.Volume/Sound, Bookings.CheckIn/Out  |    |
@@ -112,6 +120,12 @@ For the comprehensive visual Domain-Driven Design (DDD) architecture model detai
 |     +-----------------------------------------------------------------------------------------+    |
 |                                                                                                    |
 |     +-----------------------------------------------------------------------------------------+    |
+|     |                          Fleet Configuration Store Adapters                             |    |
+|     |   * DynamoFleetConfigStore: rooms, settings & append-only audit tables (VPC endpoint)   |    |
+|     |   * JsonFileFleetConfigStore: local laptop file under service/.local/ (gitignored)      |    |
+|     +-----------------------------------------------------------------------------------------+    |
+|                                                                                                    |
+|     +-----------------------------------------------------------------------------------------+    |
 |     |                      Future Adapters (Pluggable Hardware Modules)                       |    |
 |     |     * Poly / Neat Presence Driver       * Microsoft Graph Direct Calendar Driver         |    |
 |     +-----------------------------------------------------------------------------------------+    |
@@ -122,7 +136,7 @@ For the comprehensive visual Domain-Driven Design (DDD) architecture model detai
 
 ## 4. Domain Ports & Driver Abstractions
 
-To achieve true hardware vendor and notification provider agnosticism, the domain boundary defines five distinct interfaces:
+To achieve true hardware vendor and notification provider agnosticism, the domain boundary defines five room-facing interfaces (§4.1–4.5), plus two fleet-level interfaces for Control Hub discovery and durable configuration (§4.6–4.7):
 
 ### 4.1 Presence Driver (`IRoomPresenceDriver`)
 
@@ -178,7 +192,15 @@ Abstracts end-user email communications:
   - **Differentiated Templates**: Contextual messaging explicitly distinguishing **No-Show Release** (room unoccupied after meeting start) from **Early Departure Release** (room vacated and left empty before scheduled end time).
 - **Template Presentation**: Responsive multipart MIME (HTML with structured corporate branding, room name, scheduled meeting time, and clear bullet instructions) accompanied by an RFC-compliant plain-text fallback.
 - **Enterprise SMTP Adapter**: Implemented by `SmtpNotificationAdapter` connecting to `outlook.suncorp.com.au:25` via unauthenticated direct relay (with configurable overrides for port, credentials, and TLS in the admin dashboard).
-- **Simulation Safety**: In `DRY_RUN` and `MONITOR_ONLY` modes, physical SMTP delivery is suppressed; the adapter emits structured `[DRY RUN - WOULD_SEND_EMAIL]` audit logs.
+- **Simulation Safety**: In `DRY_RUN` mode, physical SMTP delivery is suppressed and the adapter emits structured `[DRY RUN - WOULD_SEND_EMAIL]` audit logs. In `MONITOR_ONLY` mode, no warning or release workflow runs, so no email (real or simulated) is produced.
+
+### 4.6 Fleet Inventory Driver (`IFleetInventoryDriver`)
+
+- `listDevices(): Promise<InventoryDevice[]>`: Lists the workspaces and devices visible to the integration in Control Hub (device ID, workspace ID and name, product, connection status, booking capability). Read-only; it never issues device xAPI calls. It is used only for roster reconciliation (§7.1).
+
+### 4.7 Fleet Configuration Store (`IFleetConfigStore`)
+
+- Loads and conditionally writes the roster and fleet settings, and appends to the audit log. It is implemented by `DynamoFleetConfigStore` (AWS) and `JsonFileFleetConfigStore` (laptop). See §8.3.
 
 ---
 
@@ -305,24 +327,38 @@ To prevent drift between external service memory and physical room states, the s
 
 ## 7. Multi-Room Fleet, Operational Safety & Configuration Dashboard
 
-### 7.1 Room Lifecycle & Maintenance Mode
+### 7.1 Room Lifecycle, Enrollment & Maintenance Mode
 
-- The service periodically synchronizes device inventory against Webex Control Hub.
-- Rooms marked `disconnected` or undergoing maintenance are flagged as `Offline`.
-- Any active countdown or warning for an offline room is immediately halted. Automation fails closed.
+**Nothing is enrolled automatically.** The Fleet Roster, persisted in the durable store (§8.3), is the sole authority on which rooms the service manages:
+
+- The service synchronizes device inventory against Webex Control Hub at startup and every 15 minutes, through the read-only `IFleetInventoryDriver`.
+- **A newly discovered workspace is recorded as `DISABLED`.** It has no room actor, and every event from it is discarded at the roster gate. The service sends it no command and no configuration write. If 10 workspaces are added to Control Hub tomorrow, the only effect is 10 new `DISABLED` roster entries, an audit record each, and a "10 discovered, not enrolled" notice on the dashboard.
+- **Only an administrator promotes a room:** `DISABLED → MONITOR_ONLY → DRY_RUN → LIVE` (or `DISABLED → DRY_RUN`). `LIVE` is reachable only from `DRY_RUN`, after a readiness report and an explicit, audited confirmation. How long a room stays in `DRY_RUN` is the administrator's judgement.
+- **The system may only demote.** A replaced device (a different device ID in the workspace) is demoted to `DISABLED` and flagged `DeviceMismatch`. A workspace with several booking-capable devices is flagged `AmbiguousWorkspace` until an admin selects one. A managed device that disappears is flagged `Missing`.
+- Rooms marked `disconnected` or undergoing maintenance are flagged as `Offline`. Any active countdown or warning for an offline room is immediately halted. Automation fails closed.
+- **Recommended second safeguard: location-limited activation.** Activate the Workspace Integration only for the Control Hub locations in scope, rather than org-wide. Per the official [workspace-integrations SDK documentation](https://github.com/cisco-ce/workspace-integrations-nodejs), when an integration "has been allowed for only certain locations", xCommands and xStatus calls to devices outside those locations fail with `403 Forbidden`. **The limit is partial:** the integration can still list every device in the org and *change device configurations* org-wide (configuration access comes from the `spark-admin:devices_write` admin scope). Location scoping therefore backs up the roster gate for commands and status, but the roster gate remains the only control over configuration writes. Because discovery lists the whole org, out-of-scope devices also appear as `DISABLED` roster entries; that is harmless, and the dashboard groups them by location.
+- Full rules: [ServiceLowLevelDesign.md §5.7, §7.1 and §8](ServiceLowLevelDesign.md).
 
 ### 7.2 Progressive Rollout Roster
 
 Each room record maintains an execution mode:
 
-- `MONITOR_ONLY`: Observes and logs telemetry; executes no prompts, emails, or booking commands.
+- `DISABLED` (default for every discovered room): no actor, no reads, no writes, no metrics. All events are discarded. Demoting a managed room to `DISABLED` first performs the mode-exit clean-up (cancel the workflow, clear prompts, restore the room's recorded native CheckIn baseline).
+
+- `MONITOR_ONLY`: A **permanent hands-off mode** for sensitive rooms (e.g. executive boardrooms) that must never be touched by automation but should still appear in utilization reporting. It is not a rollout stage; `DRY_RUN` is the rehearsal mode. The service is strictly read-only for these rooms:
+  - **No writes of any kind:** no prompts, audio, CheckIn, CheckOut, emails, or device configuration writes (presence baseline, `Bookings.CheckIn.WindowDuration`, `Bookings.CheckIn.Enabled`).
+  - **The room's own baseline stays in force.** If native RoomOS CheckIn/no-show release is enabled on the device, it keeps operating as it does today. The service observes such releases and logs them as `[EXTERNAL_RELEASE_OBSERVED]`.
+  - **No release workflow, real or simulated.** The service records utilization telemetry only: occupied/empty time against booked time, would-be no-shows, and external releases.
+  - **Missing telemetry is reported, not repaired.** If presence telemetry is unavailable (for example, sensors not configured), the dashboard flags the room as `PresenceTelemetryUnavailable` instead of writing configuration. Enabling sensors on such a room is a deliberate admin action outside this mode.
+  - Mode transitions into and out of `MONITOR_ONLY` follow [ServiceLowLevelDesign.md §5.7](ServiceLowLevelDesign.md).
 - `DRY_RUN`: Matches the macro's dry run. It writes the presence baseline and `Bookings.CheckIn.WindowDuration`, and sets `Bookings.CheckIn.Enabled = False` when the baseline has it enabled (failing closed if it cannot). It never enables native CheckIn. Booking validation is the same as `LIVE`, but the post-timeout grace period is omitted: the release horizon is `EMPTY_ROOM_TIMEOUT_MS` and the simulated warning lasts `PRE_TIMEOUT_WARNING_MS`. No actionable surface is required. It logs `[DRY RUN - INTENT_TO_AUTOMATIC_CHECK_IN]`, `[DRY RUN - SIMULATED_CHECK_IN]`, `[DRY RUN - WOULD_DISPLAY_PROMPT]`, `[DRY RUN - WOULD_SEND_EMAIL]`, and `[DRY RUN - WOULD_RELEASE]`. It suppresses prompts, audio, booking commands, and live emails. A simulated CheckIn selects the release policy but never clears startup quarantine. Occupancy during the simulated warning cancels it and schedules the (simulated) automatic CheckIn.
 - `LIVE`: Full autonomous operation.
 
 ### 7.3 Automated Anomaly Tripwire & Emergency Kill Switch
 
 - **Automated Anomaly Tripwire**: If the fleet-wide cancellation rate exceeds a safety threshold (e.g., >30 cancellations across the fleet within any 5-minute sliding window), the service automatically trips into emergency fail-closed mode and halts all releases.
-- **Instant Kill Switch**: An environment / SSM parameter (`AUTOCANCEL_KILL_SWITCH=true`) evaluated by the engine that stops all cancellation commands instantly without restarting the service.
+- **Instant Kill Switch**: Stops all cancellation commands instantly, without restarting the service. It is active if *either* the persisted store value (toggled from the dashboard) *or* the `AUTOCANCEL_KILL_SWITCH` environment/SSM parameter is true, so it survives restarts and remains usable when the store or dashboard is unavailable. Activating it always applies immediately, even if persisting fails; deactivating it requires a successful persist.
+- **Tripwire persistence**: A tripped tripwire is persisted and stays tripped across restarts until an administrator resets it.
 
 ### 7.4 Configurable Exemption Engine & Lightweight "Google-Style" Dashboard
 
@@ -338,7 +374,16 @@ The service embeds a lightweight, server-rendered administration and configurati
   - `EXEMPT_TITLE_KEYWORDS` (e.g., "Board Review", "Confidential", "Executive")
   - `NOTIFICATIONS_ENABLED` (global toggle for email notifications)
   - `SMTP_HOST` (e.g. `outlook.suncorp.com.au`), `SMTP_PORT` (e.g. 25), `SMTP_FROM` (e.g. `no-reply-roombookings@suncorp.com.au`), `SMTP_SECURE`
-  - Per-room mode toggles (`MONITOR_ONLY` / `DRY_RUN` / `LIVE`)
+  - Per-room mode changes (`DISABLED` / `MONITOR_ONLY` / `DRY_RUN` / `LIVE`), restricted to the promotion path in §7.1. `DRY_RUN → LIVE` shows the readiness report and requires explicit confirmation.
+- **Enrollment View**: Lists **Discovered (not enrolled)** rooms and rooms flagged `Missing`, `DeviceMismatch`, `AmbiguousWorkspace`, `CleanupIncomplete`, or `PresenceTelemetryUnavailable`. For an ambiguous workspace, the admin selects the managed device here.
+- **Persistence & Audit**: Every dashboard change is persisted to the fleet configuration store before it takes effect, survives restarts, and is recorded in the append-only audit log (who, when, before, after).
+- **Access Control (interim)**:
+  - The dashboard binds to `127.0.0.1` only and is never exposed on a network interface.
+  - Access requires a single shared admin password supplied through `ADMIN_DASHBOARD_PASSWORD` (an SSM `SecureString` in AWS, `.env.local` on a laptop). The password is compared in constant time and failed logins are rate-limited.
+  - Successful logins get an HTTP-only, `SameSite=Strict` session cookie, and every state-changing request requires a CSRF token.
+  - If no password is configured, the dashboard refuses to start rather than running open.
+  - Because the identity is shared, audit records use the actor `admin`.
+  - Per-user identity (corporate SSO), role separation (for example, who may promote to `LIVE`), and the remote access path in AWS are deferred to a later phase.
 
 ---
 
@@ -350,13 +395,14 @@ The service embeds a lightweight, server-rendered administration and configurati
 - Service loads `.env.local` with `NOTIFICATION_MODE=longpolling`.
 - Outbound HTTPS long-polling handles Webex device events with zero inbound ports.
 - `MockNotificationDriver` captures warning and cancellation emails, formatting rich previews to the terminal console and recording them in memory for test verification.
+- `JsonFileFleetConfigStore` persists the roster, settings, and audit log to a gitignored file under `service/.local/`, so local runs need no database. A fresh file manages no rooms until an engineer enrolls a test room.
 
 ### 8.2 Production Infrastructure on AWS (Terraform-Provisioned)
 
 To keep cloud operations as simple, maintainable, and reliable as possible, the AWS infrastructure is fully codified via Terraform. The architecture is intentionally compute-agnostic, supporting either a containerized service or a dedicated VM depending on organizational hosting standards:
 
 - **Compute Option A (Containerized - AWS ECS Fargate)**:
-  - Runs as a single active task (Min=1, Max=1) managed by an ECS Service.
+  - Runs as a single active task (Min=1, Max=1) managed by an ECS Service, deployed with `minimumHealthyPercent = 0` and `maximumPercent = 100` so two tasks never overlap (the DynamoDB lease is the second guard).
   - Zero OS maintenance, zero AMI patching, instant container startup.
   - Automatically restarts failed tasks within seconds.
 - **Compute Option B (Virtual Machine - AWS EC2 RHEL 9)**:
@@ -365,7 +411,16 @@ To keep cloud operations as simple, maintainable, and reliable as possible, the 
 - **Common Network & Security Architecture**:
   - **VPC Subnets**: Deployed strictly inside private subnets (zero public IP, zero inbound security group rules).
   - **Outbound Egress**:
-    - Outbound HTTPS (TCP 443) to Webex Cloud APIs for long-polling telemetry.
+    - Outbound HTTPS (TCP 443) to Webex Cloud APIs for long-polling telemetry and Control Hub inventory.
+    - DynamoDB through the VPC gateway endpoint (no internet path).
     - Outbound SMTP (TCP 25) routed across the enterprise network / Direct Connect / Transit Gateway to `outlook.suncorp.com.au`.
   - **Zero Plaintext Secrets**: Webex credentials and secrets injected from AWS SSM Parameter Store (`SecureString`) at startup via IAM role / instance profile.
   - **Observability**: CloudWatch Logs integration with structured JSON audit streams, CloudWatch Metric Filters for cancellation counts, and alarms on tripwire triggers.
+
+### 8.3 Fleet Configuration Store (DynamoDB)
+
+- Three on-demand tables: rooms (roster), settings (global settings and the single-instance lease), and an append-only audit table. All have point-in-time recovery, deletion protection, and encryption at rest, and are provisioned by Terraform.
+- The tables are reached from the private subnets through a **DynamoDB VPC gateway endpoint**, so no internet egress is needed. The service IAM role is scoped to these three tables, and has no update or delete permission on the audit table.
+- Room runtime state stays in memory; only admin-controlled state is durable. If the store is unreachable at startup, the service manages nothing until it loads.
+- A DynamoDB lease item ensures only one service instance drives rooms at a time (for example, during an ECS deployment overlap).
+- Details: [ServiceLowLevelDesign.md §8](ServiceLowLevelDesign.md).
