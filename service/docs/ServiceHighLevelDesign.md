@@ -6,6 +6,8 @@ This document specifies the target architecture and high-level design for an ext
 
 The service transitions the existing single-codec RoomOS macro logic to a centralized, multi-room backend service capable of managing ~800 meeting spaces. The service enforces strict policy parity with the codec-native baseline while decoupling room occupancy detection, in-room user interaction, and calendar booking operations behind clean domain boundaries.
 
+The validated macro and its [specification](../../codec-native/docs/BookingAutoCancellationSpec.md) are the behavioral authority for every room-level decision. Where this document disagrees with them, the codec-native specification governs. Service-only capabilities (email notifications, VIP/keyword exemptions, rollout modes, kill switch, tripwire, dashboard) may only add reasons to preserve a booking.
+
 ### Initial Deployment Scope
 
 - **Managed Fleet**: Approximately 800 corporate meeting rooms.
@@ -45,7 +47,7 @@ Otherwise: preserve the booking and take no action.
 
 The service is structured according to Hexagonal Architecture (Ports and Adapters). Core booking autocancellation workflow logic has zero coupling to Cisco xAPI, Webex SDKs, or cloud network protocols.
 
-For the comprehensive visual Domain-Driven Design (DDD) architecture model detailing Aggregate Roots, Domain Policies, Safety Guards, and mutable configuration bindings, see [service/docs/ServiceDomainDrivenDesign.md](service/docs/ServiceDomainDrivenDesign.md).
+For the comprehensive visual Domain-Driven Design (DDD) architecture model detailing Aggregate Roots, Domain Policies, Safety Guards, and mutable configuration bindings, see [ServiceDomainDrivenDesign.md](ServiceDomainDrivenDesign.md).
 
 ```text
 +----------------------------------------------------------------------------------------------------+
@@ -139,9 +141,9 @@ Abstracts user prompts, warnings, audio chimes, and touch responses:
   - Informational OSD (room monitor): prompts occupants to confirm on touch controller (or actionable buttons on Desk Pro).
   - Dynamic text variants: `INITIAL` text vs `REPEATED` text (when user previously tapped Keep Booking but room remains vacant).
 - `displayConfirmation(roomId: string, prompt: ConfirmationPromptRequest): Promise<PromptDisplayResult>`: Displays two-step confirmation guard (`Cancel` / `Check out`).
-- `clearWarning(roomId: string, promptId: string): Promise<void>`: Dismisses prompts across controller and OSD targets.
-- `restoreDismissedPrompt(roomId: string, prompt: WarningPromptRequest): Promise<void>`: Immediately re-displays prompt if dismissed without selection (via user swipe or `Prompt.Cleared`) for remaining warning duration.
-- `playAudioAlert(roomId: string, alert: AudioAlertConfig): Promise<void>`: Overrides volume to 70 (`Audio.Volume.Set({ Level: 70 })`), plays `Announcement` sound (`Audio.Sound.Play({ Sound: 'Announcement' })`), holds for 4 seconds, restores default volume (`Audio.Volume.SetToDefault()`), and repeats every 60s while prompt is visible.
+- `clearWarning(roomId: string): Promise<void>`: Dismisses the warning and confirmation prompts across controller and OSD targets.
+- `restoreDismissedPrompt(roomId: string, prompt: WarningPromptRequest): Promise<void>`: Immediately re-displays only the dismissed target (via user swipe or `Prompt.Cleared`) for the remaining warning duration, without extending the deadline.
+- `playAudioAlert(roomId: string): Promise<void>`: Overrides volume to 70 (`Audio.Volume.Set({ Level: 70 })`), plays `Announcement` sound (`Audio.Sound.Play({ Sound: 'Announcement' })`), holds for 4 seconds, restores default volume (`Audio.Volume.SetToDefault()`), and repeats every 60s while prompt is visible.
 - `restoreAudioVolume(roomId: string): Promise<void>`: Restores volume to default upon prompt clear or dismissal.
 - `onPromptResponse(handler: (event: PromptResponseEvent) => void): void`: Ingests user selections (`OptionId: '1'` or `'2'`).
 - `onPromptCleared(handler: (event: PromptClearedEvent) => void): void`: Ingests prompt dismissal events.
@@ -153,7 +155,7 @@ Abstracts meeting reservation metadata and release execution:
 - `getAvailability(roomId: string): Promise<RoomAvailabilitySnapshot>`: Returns `Free`, `FreeUntil`, or `BookedUntil` with timestamps.
 - `getBookingDetails(roomId: string, bookingId: string): Promise<BookingDetails>`: Queries `Bookings.Get({ Id })` with fallback to `Bookings.List({ ScheduleType: 'Current', Limit: 1 })`. Includes `BookedFromDevice` flag, organizer email/name, meeting title, start/end timestamps.
 - `checkIn(roomId: string, bookingId: string, trackingData?: string): Promise<void>`: Executes meeting check-in with `TrackingData: 'BookingAutoCancellation_Automatic'`.
-- `checkOut(roomId: string, bookingId: string, reason: string): Promise<void>`: Executes meeting release (`Bookings.CheckOut({ Id })`).
+- `checkOut(roomId: string, bookingId: string, reason: CheckOutReason): Promise<void>`: Executes meeting release (`Bookings.CheckOut({ Id })`). The reason is `NoShow`, `EarlyDeparture`, or `UserConfirmed`.
 - `onCheckedIn(handler: (event: CheckedInEvent) => void): void`: Ingests meeting check-in events (`Event.Bookings.CheckedIn`).
 
 ### 4.4 Device Configuration Driver (`IDeviceConfigDriver`)
@@ -172,7 +174,7 @@ Abstracts end-user email communications:
   - **Dynamic Time Calculation**: Never hardcodes minutes; calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (e.g. 5m, 3m) and formats the impending release time in the codec's local clock timezone.
   - **Single Warning Invariant**: Tracked per booking lifecycle; re-displaying a dismissed prompt (`restoreDismissedPrompt`) never re-sends or spams duplicate warning emails.
   - **Delivery Verification & Fail-Closed Gate**: Warning email delivery is tracked. If SMTP dispatch fails (after bounded immediate retries), the service records the delivery failure, fails closed, and **aborts the cancellation** to prevent surprise releases.
-- `sendCancellationNotice(payload: CancellationNoticePayload): Promise<NotificationResult>`: Dispatches a conclusive cancellation notice to the meeting organizer immediately following a successful calendar `checkOut()`.
+- `sendCancellationNotice(payload: CancellationNoticePayload): Promise<NotificationResult>`: Dispatches a conclusive cancellation notice to the meeting organizer immediately following a successful automatic `checkOut()`. A user-confirmed CheckOut from the room controller sends no notice.
   - **Differentiated Templates**: Contextual messaging explicitly distinguishing **No-Show Release** (room unoccupied after meeting start) from **Early Departure Release** (room vacated and left empty before scheduled end time).
 - **Template Presentation**: Responsive multipart MIME (HTML with structured corporate branding, room name, scheduled meeting time, and clear bullet instructions) accompanied by an RFC-compliant plain-text fallback.
 - **Enterprise SMTP Adapter**: Implemented by `SmtpNotificationAdapter` connecting to `outlook.suncorp.com.au:25` via unauthenticated direct relay (with configurable overrides for port, credentials, and TLS in the admin dashboard).
@@ -182,66 +184,69 @@ Abstracts end-user email communications:
 
 ## 5. End-to-End Workflow & Lifecycle State Model
 
-The room workflow state machine models every active meeting through strict lifecycle phases:
+The room workflow state machine models every active meeting through strict lifecycle phases. The complete transition matrix is in [ServiceLowLevelDesign.md §3.2](ServiceLowLevelDesign.md).
 
 ```text
   +--------------+
-  |     Idle     | <------------------------------------------+
-  +-------+------+                                            |
-          | Booking starts (BookedUntil)                      |
-          v                                                   |
-  +--------------+                                            |
-  |  Quarantined | (If meeting was active at service startup) |
-  +-------+------+                                            |
-          | Verified RoomOS CheckedIn event arrives           |
-          v                                                   |
-  +--------------+                                            |
-  | ActiveMeeting|                                            |
-  +-------+------+                                            |
-          | Room becomes Empty                                |
-          v                                                   |
-  +--------------+                                            |
-  |  Countdown   | ---> Room becomes Occupied ----------------+
-  |  Scheduled   |                                            |
-  +-------+------+                                            |
-          | Timer expires (e.g. 5 min remaining)              |
-          v                                                   |
-  +--------------+                                            |
-  |PromptVisible | ---> User taps "Keep Booking" -------------+
-  +-------+------+                                            |
-          | User taps "Check Out"                             |
-          | OR Timer reaches zero (Empty Room Timeout)        |
-          v                                                   |
-  +--------------+                                            |
-  | JIT Validate | ---> Presence != Empty OR Booking Changed -+
-  +-------+------+                                            |
-          | Conclusively Verified Vacant & Safe               |
-          v                                                   |
-  +--------------+                                            |
-  |   Released   | -------------------------------------------+
+  |     Idle     | <--------------------------------------------------+
+  +-------+------+                                                    |
+          | Booking starts (BookedUntil)                              |
+          |                                                           |
+          +--> Quarantined (meeting already active at service start)  |
+          |      | only a matching RoomOS CheckedIn event releases it |
+          v      v                                                    |
+  +--------------+                                                    |
+  | ActiveMeeting| <-- Keep Booking / Cancel (presence re-read) ------+
+  +-------+------+                                                    |
+          | Room becomes Empty (No-Show, or Early Departure           |
+          | after CheckIn when enabled) and time remaining > horizon  |
+          v                                                           |
+  +--------------+                                                    |
+  |  Countdown   | ---> Room becomes Occupied: cancel, auto CheckIn --+
+  |  Scheduled   |                                                    |
+  +-------+------+                                                    |
+          | EMPTY_ROOM_TIMEOUT - PRE_TIMEOUT_WARNING elapses          |
+          v                                                           |
+  +--------------+  Occupied: prompt RETAINED for user action         |
+  |PromptVisible |  Dismissed: prompt RESTORED (deadline unchanged)   |
+  |              |  Check Out: confirmation guard -> Confirm releases |
+  +-------+------+    immediately (UserConfirmed, no notice email)    |
+          | Fixed deadline reached (warning + grace)                  |
+          v                                                           |
+  +--------------+                                                    |
+  | JIT Validate | ---> Any check fails: preserve booking ------------+
+  +-------+------+                                                    |
+          | Every check passes (LLD §5.5)                             |
+          v                                                           |
+  +--------------+                                                    |
+  |   Released   | ---> Free / FreeUntil -----------------------------+
   +--------------+
+
+  At any phase: Unknown presence, Free/FreeUntil, booking rollover, or a failed
+  health check cancels the workflow and preserves the booking.
 ```
 
 ### 5.1 No-Show Release Policy
 
 1. Meeting starts, room remains vacant, no check-in recorded.
 2. **Booking Sync Coalescing**: Buffers rapid bursts of `BookedUntil` and `TimeStamp` events for 50ms before reading booking details to ensure an atomic snapshot.
-3. **Bounded Readiness Recovery**: If transient metadata is missing (`Bookings.Current.Id` null or `Bookings.Get` error), retries on `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` with `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` fallback.
-4. **Minimum Remaining Time Guard**: Verifies `timeRemaining = endTime - now`. If `timeRemaining <= EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS` (e.g. $\le 12$ minutes), autocancellation is skipped and logged.
-5. At `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS` (e.g. at remaining warning window determined dynamically by `PRE_TIMEOUT_WARNING_MS`), the service checks for an actionable surface (`hasActionableSurface`).
-6. If valid:
-   - The service issues `displayWarning` with initial text and starts the 60s audio chime loop. Controller displays `Keep this booking?`.
+3. **Bounded Readiness Recovery**: If transient metadata is missing or unavailable, each attempt on `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` rebuilds the full snapshot. It uses `Bookings.Get({ Id })` when the booking ID is known and `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` when it is missing. Exhaustion preserves the booking until the next room event or midnight health check (LLD §5.3).
+4. **Minimum Remaining Time Guard**: Verifies `timeRemaining = endTime - now`. A countdown starts only if `timeRemaining > EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS` (`LIVE`, e.g. strictly more than 12 minutes) or `> EMPTY_ROOM_TIMEOUT_MS` (`DRY_RUN`). Otherwise autocancellation is skipped and logged.
+5. At `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS`, the service fixes one warning deadline (`PRE_TIMEOUT_WARNING_MS + POST_TIMEOUT_GRACE_PERIOD_MS`) and presents the prompt on every currently suitable surface.
+6. Prompt phase:
+   - The service issues `displayWarning` with initial text and starts the 60s audio chime loop. The controller displays `Keep this booking?`.
+   - If no actionable surface accepts the prompt, the service logs it and keeps the deadline so a reconnecting controller receives the remaining time. Expiry without an actionable surface preserves the booking.
    - The service dispatches `sendCancellationWarning` via `INotificationDriver` to the meeting organizer's email. Warning email delivery is tracked; if delivery fails after immediate retries, the service fails closed and marks the booking protected from release.
-7. If untouched and room remains vacant until timeout + grace period:
-   - The JIT Probe verifies vacancy and unchanged booking identity.
+7. If untouched and the room remains vacant until timeout + grace period:
+   - The JIT Probe runs the full release validation checklist (LLD §5.5): vacancy, actionable prompt ownership, unchanged booking identity, and fresh reclassification.
    - The service issues `checkOut`.
    - Upon confirmed checkout, the service dispatches `sendCancellationNotice` (No-Show template) to the organizer.
 
 ### 5.2 Early Departure Release Policy
 
-1. Meeting started and was checked in (either manually, via ad hoc booking, or auto-checkin).
+1. Meeting started, and CheckIn was confirmed by a matching RoomOS `Bookings.CheckedIn` event (manual, ad hoc, or the service's automatic CheckIn). A successful CheckIn command alone is not confirmation. In `DRY_RUN`, a validated simulated automatic CheckIn counts for policy selection only.
 2. Attendees leave early. Presence changes to `Empty`.
-3. If `EARLY_DEPARTURE_RELEASE_ENABLED` is true, the service initiates the empty-room countdown:
+3. If `EARLY_DEPARTURE_RELEASE_ENABLED` is true (default `false`), the service initiates the empty-room countdown. When it is false, post-CheckIn vacancy is logged and starts no release workflow:
    - At `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS`, displays in-room warning and dispatches `sendCancellationWarning` to the organizer.
    - If vacated until timeout + grace period, executes JIT Probe, issues `checkOut`, and dispatches `sendCancellationNotice` (Early Departure template).
 
@@ -249,7 +254,7 @@ The room workflow state machine models every active meeting through strict lifec
 
 1. **Long-Meeting Exemption**: Current bookings exceeding `LONG_MEETING_EXEMPTION_THRESHOLD_MS` (default 120 minutes) or unclassifiable bookings are classified as `Long` or `Unclassifiable`. Autocancellation is strictly `Blocked`.
 2. **VIP & Group Exemption**: Meetings organized by individuals in `EXEMPT_ORGANIZERS` (e.g. executive assistants, C-suite) or matching configured department/title tags are classified as `Exempt` and blocked from release.
-3. **Native Check-In Toggling**: For any exempt meeting, `setNativeCheckInEnabled(roomId, false)` is issued to disable native RoomOS no-show cancellation. When the meeting ends, `setNativeCheckInEnabled(roomId, true)` restores the baseline.
+3. **Native Check-In Toggling**: For any exempt, unclassifiable, quarantined, or otherwise blocked meeting, `setNativeCheckInEnabled(roomId, false)` is issued to disable native RoomOS no-show cancellation. While meeting length is still being verified, no write is made. When the meeting ends, `setNativeCheckInEnabled(roomId, true)` restores the baseline (LLD §5.6).
 
 ### 5.4 Ad Hoc "Booked from Device" Guard
 
@@ -263,6 +268,19 @@ When a room transitions to `Free` or `FreeUntil` before its scheduled end time, 
 
 The service parses each codec's local ISO timezone offset (e.g. `+02:00`), calculates the exact millisecond delay until local midnight on that physical codec, and schedules a midnight health check. If timezone offset is unavailable or invalid, the service flags `CodecTimeUnavailable` and suspends automatic release.
 
+### 5.7 Presence, Prompt, and User-Interaction Rules (Macro Parity)
+
+- **Occupancy before the prompt** cancels the countdown and schedules one automatic CheckIn.
+- **Occupancy while the prompt is visible** retains the prompt so occupants can act. Automatic CheckIn is deferred. Expiry with confirmed occupancy aborts release (`room_not_confirmed_empty`), clears the prompt, preserves the booking, and schedules automatic CheckIn.
+- **Unknown presence** at any phase cancels the workflow and blocks release until a full presence revalidation succeeds.
+- **Keep Booking** (or `Cancel` on the confirmation) clears both prompts, stops the chime, and re-reads presence. `Empty` starts a fresh countdown whose later warning uses `REPEATED` text. `Occupied` schedules automatic CheckIn. `Unknown` suspends autocancellation.
+- **Check Out** opens a confirmation guard on the remaining deadline. Confirming issues an immediate `checkOut(..., 'UserConfirmed')` after re-reading the booking snapshot, with no cancellation notice. If the deadline expires unconfirmed, release is aborted; a re-read `Empty` restores the original warning with a full new deadline, and any other result preserves the booking.
+- **Dismissal without a selection** restores only the dismissed target, for the remaining time. The deadline is never extended and no duplicate warning email is sent.
+- **Stale or unmatched prompt responses** are logged and ignored.
+- **Controller topology changes** during a prompt clear an unavailable controller prompt and show a reconnecting controller the remaining time, without changing the deadline.
+- **Automatic CheckIn** is attempted at most once per lifecycle, carries `TrackingData: BookingAutoCancellation_Automatic`, and revalidates booking, end time, and occupancy before sending. It is suppressed by a matching `CheckedIn` event or `BookedFromDevice`. `Cannot check in booking that is already checked in.` is logged as informational. A failed automatic CheckIn never blocks a later No-Show release.
+- **CheckOut failure** records `Blocked / CheckOutFailed` for the rest of the lifecycle. The service never falls back to `Delete`.
+
 ---
 
 ## 6. Two-Tier Reconciler Architecture
@@ -272,8 +290,8 @@ To prevent drift between external service memory and physical room states, the s
 ### Tier 1: Just-In-Time (JIT) Synchronous Verification Probe
 
 - **Execution Point**: Executed synchronously at the exact moment before a release command is dispatched ($T=0$).
-- **Direct Hardware Verification**: Calls `getPresence(roomId)` and `getAvailability(roomId)` directly.
-- **Fail-Closed Gate**: If the room is `Occupied`, `Unknown`, the booking ID changed, or the call fails/times out, the release is aborted immediately and logged as `ReleaseAbortedPreserved`.
+- **Direct Hardware Verification**: Calls `getPresence(roomId)`, `getAvailability(roomId)`, and `getBookingDetails(roomId, bookingId)` directly. In `LIVE` mode it also re-verifies that an actionable surface still owns the displayed prompt. The full ordered checklist is in LLD §5.5.
+- **Fail-Closed Gate**: If the room is `Occupied` or `Unknown`, no actionable surface owns the prompt, the booking ID or end time changed, the booking reclassifies as long or unclassifiable, or any call fails or times out, the release is aborted immediately and logged as `ReleaseAbortedPreserved`.
 
 ### Tier 2: Background Drift & Health Sweeper
 
@@ -298,7 +316,7 @@ To prevent drift between external service memory and physical room states, the s
 Each room record maintains an execution mode:
 
 - `MONITOR_ONLY`: Observes and logs telemetry; executes no prompts, emails, or booking commands.
-- `DRY_RUN`: Simulates countdowns, logs `[DRY RUN - WOULD_DISPLAY_PROMPT]`, `[DRY RUN - WOULD_SEND_EMAIL]`, and `[DRY RUN - WOULD_RELEASE]`; suppresses external commands and live emails.
+- `DRY_RUN`: Matches the macro's dry run. It writes the presence baseline and `Bookings.CheckIn.WindowDuration`, and sets `Bookings.CheckIn.Enabled = False` when the baseline has it enabled (failing closed if it cannot). It never enables native CheckIn. Booking validation is the same as `LIVE`, but the post-timeout grace period is omitted: the release horizon is `EMPTY_ROOM_TIMEOUT_MS` and the simulated warning lasts `PRE_TIMEOUT_WARNING_MS`. No actionable surface is required. It logs `[DRY RUN - INTENT_TO_AUTOMATIC_CHECK_IN]`, `[DRY RUN - SIMULATED_CHECK_IN]`, `[DRY RUN - WOULD_DISPLAY_PROMPT]`, `[DRY RUN - WOULD_SEND_EMAIL]`, and `[DRY RUN - WOULD_RELEASE]`. It suppresses prompts, audio, booking commands, and live emails. A simulated CheckIn selects the release policy but never clears startup quarantine. Occupancy during the simulated warning cancels it and schedules the (simulated) automatic CheckIn.
 - `LIVE`: Full autonomous operation.
 
 ### 7.3 Automated Anomaly Tripwire & Emergency Kill Switch

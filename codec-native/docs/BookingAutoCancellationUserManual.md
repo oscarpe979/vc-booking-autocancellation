@@ -44,7 +44,7 @@ The macro writes the required RoomAnalytics settings and the RoomOS CheckIn wind
 
 ## Configuration
 
-Update `CONFIG` in [BookingAutoCancellation.js](BookingAutoCancellation.js) through the approved source-control and deployment process. Treat these values as room policy, not implementation constants.
+Update `CONFIG` in [BookingAutoCancellation.js](../BookingAutoCancellation.js) through the approved source-control and deployment process. Treat these values as room policy, not implementation constants.
 
 | Setting | Operational purpose | Configuration rule |
 | --- | --- | --- |
@@ -170,4 +170,4 @@ Routine diagnostics use `console.debug` when `DEBUG` is enabled. Warnings and er
 
 - [BookingAutoCancellationHighLevelDesign.md](BookingAutoCancellationHighLevelDesign.md): governance-oriented architecture, boundaries, risks, and workflow design.
 - [BookingAutoCancellationSpec.md](BookingAutoCancellationSpec.md): detailed technical contract, edge cases, and test requirements.
-- [test_BookingAutoCancellation.js](test_BookingAutoCancellation.js): executable behavior contract.
+- [test_BookingAutoCancellation.js](../test_BookingAutoCancellation.js): executable behavior contract.

@@ -105,8 +105,9 @@ flowchart LR
 
 ### 3.2 Dynamic Fleet Configuration Model
 
-- **Timing Thresholds**: `EMPTY_ROOM_TIMEOUT_MS` (default 10m), `PRE_TIMEOUT_WARNING_MS` (default 5m), `POST_TIMEOUT_GRACE_PERIOD_MS` (default 2m), `AUTOMATIC_CHECK_IN_DELAY_MS` (3s), and `BOOKING_SYNC_COALESCE_DELAY_MS` (50ms).
-- **Exemption Rules**: `LONG_MEETING_THRESHOLD_MS` (120m), `EXEMPT_ORGANIZERS` (VIP email list), and `EXEMPT_TITLE_KEYWORDS` (e.g. "Board", "Executive", "Confidential").
+- **Timing Thresholds**: `EMPTY_ROOM_TIMEOUT_MS` (default 10m), `PRE_TIMEOUT_WARNING_MS` (default 5m), `POST_TIMEOUT_GRACE_PERIOD_MS` (default 2m), `AUTOMATIC_CHECK_IN_DELAY_MS` (3s), `BOOKING_SYNC_COALESCE_DELAY_MS` (50ms), and `BOOKING_READINESS_RECOVERY_DELAYS_MS` (`[250, 500, 1000, 2000, 4000]`).
+- **Room Policy Parity Settings** (same meaning and defaults as the macro `CONFIG`): `EARLY_DEPARTURE_RELEASE_ENABLED` (default `false`), `NATIVE_CHECK_IN_WINDOW_MINUTES` (default 60; must exceed the effective release horizon), and `ULTRASOUND_SENSOR_ENABLED` (default `false`; writes `PeoplePresence.Input.Ultrasound` `On`/`Off`).
+- **Exemption Rules**: `LONG_MEETING_EXEMPTION_THRESHOLD_MS` (120m), `EXEMPT_ORGANIZERS` (VIP email list), and `EXEMPT_TITLE_KEYWORDS` (e.g. "Board", "Executive", "Confidential").
 - **SMTP & Notification Settings**: `NOTIFICATIONS_ENABLED` (boolean), `SMTP_HOST` (`outlook.suncorp.com.au`), `SMTP_PORT` (25), `SMTP_FROM`, and `SMTP_SECURE`.
 - **Safety & Rollout Modes**: `AUTOCANCEL_KILL_SWITCH`, fleet anomaly spike threshold (>30 releases / 5 min), and per-room operational mode (`MONITOR_ONLY`, `DRY_RUN`, `LIVE`).
 
@@ -118,19 +119,19 @@ flowchart LR
 
 ### 3.4 Domain Policies (Business Logic)
 
-- **`MeetingExemptionPolicy`**: Classifies meetings longer than `LONG_MEETING_THRESHOLD_MS` or matching `EXEMPT_ORGANIZERS` / `EXEMPT_TITLE_KEYWORDS` as exempt. Serializes commands to set `Bookings.CheckIn.Enabled: False` via a FIFO queue to protect exempt meetings from native RoomOS auto-release.
+- **`MeetingExemptionPolicy`**: Classifies meetings longer than `LONG_MEETING_EXEMPTION_THRESHOLD_MS` or matching `EXEMPT_ORGANIZERS` / `EXEMPT_TITLE_KEYWORDS` as exempt. Serializes commands to set `Bookings.CheckIn.Enabled: False` via a FIFO queue to protect exempt meetings from native RoomOS auto-release.
 - **`StartupQuarantinePolicy`**: Quarantines meetings underway when the service initializes or restarts (`AwaitingStartupCheckIn`). Strictly prevents auto-cancellation until fresh in-room occupancy and check-in confirmation are observed.
 - **`WarningNotificationPolicy`**: Calculates remaining countdown minutes dynamically from `PRE_TIMEOUT_WARNING_MS` (never hardcoded), formats the release time in the codec's local clock timezone, and enforces a single-warning invariant per booking lifecycle.
 - **`FleetAnomalyTripwire`**: Monitors fleet-wide cancellation frequency; automatically trips into safe hold if cancellations exceed 30 within any sliding 5-minute window.
 
 ### 3.5 Safety Invariant Guards (Mandatory Fail-Closed Gates)
 
-All four gates must evaluate to **Clear** before any room release command may proceed:
+All four gates must evaluate to **Clear** before any automatic room release command may proceed. A user-confirmed Check Out bypasses the vacancy and email gates (as in the macro) but still requires a fresh booking snapshot with an unchanged booking ID:
 
 1. **`ActionableSurfaceGuard`**: Discovers touch panels (`TouchPanel`, `Role: Controller`) and certified interactive displays (`Desk Pro`). Strictly filters out outside `RoomScheduler` panels. Aborts release if the room lacks an interactive controller.
 2. **`MandatoryEmailProofGuard`**: Verifies that the cancellation warning email was successfully dispatched via SMTP. If delivery fails after retries, the service **fails closed and preserves the booking**.
 3. **`MinimumRemainingTimeGuard`**: Skips autocancellation if `timeRemaining <= EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS` ($\le 12$ minutes), allowing concluding meetings to end naturally.
-4. **`SynchronousJitProbeGuard`**: Directly queries physical presence and booking availability at $T=0$. If the space is occupied, sensor state is unknown, or the booking changed, the release is aborted and the booking preserved.
+4. **`SynchronousJitProbeGuard`**: Directly queries physical presence, booking availability, and fresh booking details at $T=0$, and re-verifies actionable prompt ownership. If the space is occupied, sensor state is unknown, the booking changed or reclassifies as long or unclassifiable, or no actionable surface owns the prompt, the release is aborted and the booking preserved (checklist in [ServiceLowLevelDesign.md §5.5](ServiceLowLevelDesign.md)).
 
 ### 3.6 Outbound Domain Ports (Hexagonal Seams)
 

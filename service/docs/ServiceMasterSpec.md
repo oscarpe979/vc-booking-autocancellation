@@ -109,7 +109,7 @@ To accommodate corporate development laptop security constraints alongside priva
 
 ### 5. Two-Tier Reconciler Engine
 
-- **Tier 1 (Just-In-Time Verification Probe)**: Executed synchronously at $T=0$ immediately before any checkout command is issued. Queries the physical room presence and calendar availability in real time. If the room is occupied, status is unknown, or the booking changed, checkout is aborted and the booking is preserved.
+- **Tier 1 (Just-In-Time Verification Probe)**: Executed synchronously at $T=0$ immediately before any automatic checkout command is issued. It queries physical room presence, calendar availability, and fresh booking details in real time, and re-verifies that an actionable surface still owns the prompt. If the room is occupied, status is unknown, no actionable surface owns the prompt, the booking changed, or the booking reclassifies as long or unclassifiable, checkout is aborted and the booking is preserved.
 - **Tier 2 (Background Drift & Health Sweeper)**: Runs periodically (e.g. every 15 minutes) and at codec-local midnight to identify orphaned room timers, detect devices that went offline, and re-verify presence sensor configurations.
 
 ### 6. Actionable Surface Authorization Guard
@@ -122,7 +122,7 @@ To accommodate corporate development laptop security constraints alongside priva
 
 - **Duration Threshold**: Meetings with a verified duration strictly greater than 120 minutes (configurable via `LONG_MEETING_EXEMPTION_THRESHOLD_MS`) are classified as `Long` and blocked from autocancellation.
 - **VIP Organizers & Groups**: Configurable list of organizer email addresses (`EXEMPT_ORGANIZERS`) and meeting title keywords (`EXEMPT_TITLE_KEYWORDS`) that automatically block autocancellation.
-- **Unclassifiable Meetings**: Malformed or unverified meeting details default to `Blocked` with reason `UnclassifiableMeeting`.
+- **Unclassifiable Meetings**: Malformed or unverified meeting details default to `Blocked` with reason `CouldNotVerifyCurrentBooking` (the codec-native reason for an unclassifiable meeting).
 
 ### 8. Progressive Rollout & Safety Controls
 
@@ -145,7 +145,9 @@ To accommodate corporate development laptop security constraints alongside priva
 - When the warning prompt appears, the service overrides volume to 70%, plays the `Announcement` sound, holds for 4 seconds, restores volume to default, and repeats every 60 seconds.
 - Displays actionable prompt on touch controllers and informational text on room monitors (OSD).
 - Uses `INITIAL` text for the first warning and `REPEATED` text if a user previously kept the booking but the room remains empty.
-- Automatically re-displays the prompt if dismissed without selection (via user swipe or `Prompt.Cleared`) for the remaining warning duration.
+- Automatically re-displays the prompt if dismissed without selection (via user swipe or `Prompt.Cleared`) for the remaining warning duration, without extending the deadline.
+- Occupancy detected while the prompt is visible keeps the prompt on screen so occupants can act. Release is still blocked at expiry if the room is occupied.
+- "Check Out" opens a confirmation guard; a confirmed checkout is issued immediately with reason `UserConfirmed`. "Keep Booking" and confirmation "Cancel" re-read presence and may start a fresh countdown only if the room is still empty.
 
 ### 11. Native Check-In Window Enforcement & Serialized Toggling
 
@@ -155,8 +157,8 @@ To accommodate corporate development laptop security constraints alongside priva
 ### 12. Bounded Readiness Recovery & Booking Sync Coalescing
 
 - Implements a 50ms coalescing guard (`BOOKING_SYNC_COALESCE_DELAY_MS`) to buffer rapid bursts of `BookedUntil` and `TimeStamp` events.
-- Executes bounded readiness recovery on delays of `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` with `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` fallback if transient room metadata is unavailable.
-- Skips autocancellation if remaining meeting duration is $\le 12$ minutes (`EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS`).
+- Executes bounded readiness recovery on delays of `[250ms, 500ms, 1000ms, 2000ms, 4000ms]` when transient room metadata is unavailable. Each attempt rebuilds the full snapshot using `Bookings.Get({ Id })` for a known ID or `Bookings.List({ ScheduleType: 'Current', Limit: 1 })` when the ID is missing. Exhaustion preserves the booking.
+- Skips autocancellation if remaining meeting duration is $\le 12$ minutes (`EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS`; `DRY_RUN` omits the grace period, matching the macro).
 
 ### 13. Lightweight "Google-Style" Admin & Configuration Dashboard
 
@@ -172,7 +174,7 @@ To accommodate corporate development laptop security constraints alongside priva
 - **Mandatory Warning Email Precondition (Fail-Closed)**: When the in-room countdown warning prompt is displayed, an urgent warning email is dispatched to the meeting organizer. The service requires successful delivery verification; if SMTP dispatch fails after immediate retries, the cancellation workflow is aborted and the booking is preserved to prevent unannounced releases.
 - **Dynamic Timing & Local Clock Presentation**: The warning email dynamically calculates the remaining warning duration directly from `PRE_TIMEOUT_WARNING_MS` (never hardcoded 5 minutes) and displays the release time in the codec's local clock timezone.
 - **Single Warning Invariant**: Tracked per booking lifecycle; prompt dismissals and re-displays (`restoreDismissedPrompt`) do not send duplicate warning emails.
-- **Differentiated Cancellation Receipts**: Upon successful calendar release, dispatches a conclusive receipt explicitly distinguishing **No-Show Release** from **Early Departure Release**.
+- **Differentiated Cancellation Receipts**: Upon successful automatic calendar release, dispatches a conclusive receipt explicitly distinguishing **No-Show Release** from **Early Departure Release**. A user-confirmed checkout from the room controller sends no receipt.
 - **Template Architecture**: Multipart MIME (HTML + RFC-compliant plain text) with corporate styling, meeting title, room location, and clear action guidance.
 - **Local Development**: Emulated via `MockNotificationDriver` with formatted terminal logging and in-memory capture for test assertions.
 
@@ -196,8 +198,9 @@ To accommodate corporate development laptop security constraints alongside priva
 
 - **No-Show Release Lifecycle**: Empty room triggers countdown, warning prompt displays, warning email dispatches to organizer, room remains empty, JIT probe confirms vacancy, checkout is issued, cancellation email dispatches.
 - **User Keep Booking**: Warning prompt displays; user selects "Keep Booking"; prompt dismisses; meeting is preserved; countdown resets safely; no duplicate warning email sent on subsequent prompt restoration.
-- **User Early Checkout**: User selects "Check Out"; confirmation prompt displays; user confirms; checkout is executed immediately.
-- **Occupancy Interruption**: Room becomes occupied during countdown; countdown cancels; meeting preserved.
+- **User Early Checkout**: User selects "Check Out"; confirmation prompt displays; user confirms; checkout is executed immediately with reason `UserConfirmed` and no cancellation receipt.
+- **Occupancy Interruption**: Room becomes occupied during countdown; countdown cancels; automatic CheckIn is scheduled; meeting preserved.
+- **Occupancy During Visible Prompt**: Room becomes occupied while the prompt is visible; the prompt stays visible; at expiry the release aborts and the booking is preserved.
 - **Startup Quarantine**: Service starts with active meeting; room is empty; no countdown or release occurs; meeting remains quarantined until fresh check-in.
 - **Long Meeting Exemption**: 3-hour meeting begins; room is empty; autocancellation is blocked; no prompt, email, or checkout occurs.
 - **JIT Verification Abort**: Room is empty throughout countdown, but person enters at $T=0$ before checkout; JIT probe detects presence; checkout command is suppressed; booking preserved.
@@ -218,5 +221,5 @@ To accommodate corporate development laptop security constraints alongside priva
 
 ## Further Notes
 
-- The service maintains complete behavioral parity with the proven implementation in the codec-native macro.
+- The service maintains complete behavioral parity with the proven implementation in the codec-native macro. The macro and its [specification](../../codec-native/docs/BookingAutoCancellationSpec.md) are the authority for every room-level behavior. Where a service document disagrees, the codec-native specification governs and the service document must be corrected. Service-only capabilities may only add reasons to preserve a booking.
 - The architecture is designed so that Sprint 1 can be developed, tested, and validated 100% on a local engineer laptop using outbound long-polling, while being fully production-ready for AWS deployment in subsequent sprints.

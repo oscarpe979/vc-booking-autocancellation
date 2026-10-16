@@ -1,6 +1,6 @@
 # Booking Autocancellation Subsystem Specification
 
-This is the implementation contract for [BookingAutoCancellation.js](BookingAutoCancellation.js). It describes the behavior required for a Cisco RoomOS QuickJS macro that autocancels an active booking only when the room is confidently unused and every safety requirement is healthy.
+This is the implementation contract for [BookingAutoCancellation.js](../BookingAutoCancellation.js). It describes the behavior required for a Cisco RoomOS QuickJS macro that autocancels an active booking only when the room is confidently unused and every safety requirement is healthy.
 
 The document is intentionally stricter than a best-effort autocancellation design. A booking must be preserved whenever the macro cannot prove that booking autocancellation is safe.
 
@@ -137,7 +137,7 @@ The room use check prompt sound is optional. Failure to play it must be logged b
 
 ## 4. Configuration and Runtime Values
 
-`CONFIG` owns deployment policy. Its current values are intentionally defined only in [BookingAutoCancellation.js](BookingAutoCancellation.js); the values below describe the constraints and relationships that must remain true when a deployment changes them.
+`CONFIG` owns deployment policy. Its current values are intentionally defined only in [BookingAutoCancellation.js](../BookingAutoCancellation.js); the values below describe the constraints and relationships that must remain true when a deployment changes them.
 
 - `CONFIG.EMPTY_ROOM_TIMEOUT_MS` defines the base empty-room timeout before release validation.
 - `CONFIG.PRE_TIMEOUT_WARNING_MS` defines the final portion of the base empty-room timeout reserved for the room use check prompt. Deployments should keep it no greater than `CONFIG.EMPTY_ROOM_TIMEOUT_MS` so the configured warning point is not before the countdown begins.
@@ -565,7 +565,7 @@ The implementation is acceptable only if all of these remain true:
 
 ## 17. Regression Test Requirements
 
-The primary automated suite is [test_BookingAutoCancellation.js](test_BookingAutoCancellation.js). It runs the macro in a Node.js VM with mocked xAPI calls and fake timers. It validates macro behavior, not physical sensor accuracy.
+The primary automated suite is [test_BookingAutoCancellation.js](../test_BookingAutoCancellation.js). It runs the macro in a Node.js VM with mocked xAPI calls and fake timers. It validates macro behavior, not physical sensor accuracy.
 
 The production macro starts automatically unless `AUTO_RELEASE_BOOKING_TEST_MODE` is defined. The VM defines that flag, then calls `init()` explicitly. This keeps the production startup path intact without rewriting the macro's final `init()` call.
 
@@ -648,10 +648,10 @@ The suite also covers these lifecycle and safety cases:
 
 Tests must assert observable behavior: commands sent and their IDs, command counts, timer ownership, prompt display/clear calls, readiness-related blocking, and stale-operation suppression. A test that merely executes a function without asserting the previously unsafe behavior is insufficient.
 
-Run the current suite with:
+Run the current suite from the repository root with:
 
 ```text
-node .\macros\_shared\BookingAutoCancellation\test_BookingAutoCancellation.js
+node codec-native/test_BookingAutoCancellation.js
 ```
 
 ## 18. End-to-End Codec Checklist
