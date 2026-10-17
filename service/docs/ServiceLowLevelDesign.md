@@ -131,16 +131,21 @@ export interface ConfirmationPromptRequest {
 
 export type PromptRequest = WarningPromptRequest | ConfirmationPromptRequest;
 
-// What the room can show right now. Refreshed on demand (§5.11): controller
-// topology changes cannot be subscribed to through a Workspace Integration.
+// What the room can show right now. Controller topology cannot be subscribed to
+// through a Workspace Integration, so it is read just in time at fixed workflow
+// points only (§5.11): before a display, after it resolves, on each 60 s chime
+// tick while a prompt is visible, and at JIT check 5. No listener, no polling timer.
 export interface PromptSurfaces {
-  readonly controllerConnected: boolean; // >= 1 Peripherals.ConnectedDevice with Status=Connected, Type=TouchPanel, Role=Controller
+  readonly inventoryReadable: boolean; // false when the ConnectedDevice read failed or returned 403
+  // Sorted IDs of Peripherals.ConnectedDevice entries with Status=Connected,
+  // Type=TouchPanel, Role=Controller. RoomScheduler Navigators are excluded.
+  readonly controllerIds: readonly string[];
   readonly interactiveOsd: boolean; // SystemUnit.ProductPlatform is a verified interactive OSD (Desk Pro)
-  readonly inventoryReadable: boolean; // false when the ConnectedDevice read failed
 }
 
+// The coordinator, not the driver, decides ownership from the surface reads (§5.11).
 export interface PromptDisplayResult {
-  readonly displayedOnController: boolean;
+  readonly controllerCommandAccepted: boolean; // Prompt.Display Target=Controller was accepted
   readonly displayedOnOsd: boolean;
   readonly osdActionable: boolean; // true only for an interactive OSD
 }
@@ -158,7 +163,9 @@ export interface PromptClearedEvent {
 }
 
 export interface IRoomInteractionDriver {
-  refreshPromptSurfaces(roomId: string): Promise<PromptSurfaces>;
+  readPromptSurfaces(roomId: string): Promise<PromptSurfaces>; // Never rejects; a failed or 403 read sets inventoryReadable=false
+  // Always sends Target=Controller (a Navigator controller is assumed), plus the
+  // OSD per the platform rules, whatever the surface read found.
   displayPrompt(roomId: string, prompt: PromptRequest, surfaces: PromptSurfaces): Promise<PromptDisplayResult>;
   // Restores only the dismissed target, for the remaining duration.
   restoreDismissedPrompt(roomId: string, target: PromptTarget, prompt: PromptRequest): Promise<boolean>;
@@ -175,26 +182,44 @@ export interface IRoomInteractionDriver {
 // --- 3. CALENDAR OPERATIONS PORT ---
 export type CheckInResult =
   | { readonly outcome: 'CheckedIn' } // Command succeeded
-  | { readonly outcome: 'AlreadyCheckedIn' } // 'Cannot check in booking that is already checked in.'
+  // Classified at the adapter by a case-insensitive substring match on 'already checked in'
+  // (macro text: 'Cannot check in booking that is already checked in.'). The exact
+  // text over SSH and the cloud is pending device test DT2. Any other error is 'Failed'.
+  | { readonly outcome: 'AlreadyCheckedIn' }
   | { readonly outcome: 'Failed'; readonly error: string };
+
+// PENDING device test DT1. Exists only if Bookings.Get/List or xStatus exposes a
+// booking's CheckIn state. If DT1 shows it does not, this type and
+// getCheckInState() are removed and the residual gap in §5.9 applies.
+export type BookingCheckInState = 'CheckedIn' | 'NotCheckedIn';
 
 export interface ICalendarDriver {
   getAvailability(roomId: string): Promise<RoomAvailabilitySnapshot | null>; // null when the read fails (never mapped to Free)
   getBookingDetails(roomId: string, bookingId: string): Promise<BookingDetails | null>; // Bookings.Get({ Id })
   getCurrentBooking(roomId: string): Promise<BookingDetails | null>; // Bookings.List({ ScheduleType: 'Current', Limit: 1 }); used only when the ID is missing
+  getCheckInState(roomId: string, bookingId: string): Promise<BookingCheckInState | null>; // PENDING DT1; read-only, no side effects; null when unreadable
   checkIn(roomId: string, bookingId: string, trackingData: string): Promise<CheckInResult>;
   checkOut(roomId: string, bookingId: string, reason: CheckOutReason): Promise<void>; // Rejects on failure
   // No onCheckedIn: Bookings.CheckedIn is not delivered to Workspace Integrations (§5.9, §9).
 }
 
-// --- 4. DEVICE CONFIGURATION PORT ---
+// --- 4. DEVICE CONFIGURATION AND HEALTH PORT ---
+export interface DeviceBootEvent {
+  readonly roomId: string;
+  readonly action: 'Restart' | 'Shutdown' | 'Upgrade' | 'Unknown'; // BootEvent fires BEFORE the restart (§9)
+}
+
 export interface IDeviceConfigDriver {
+  // RoomAnalytics presence baseline (§5.12), batched with xapi.config.setMany where possible.
   enforceBaselinePresenceConfig(roomId: string, ultrasoundEnabled: boolean): Promise<boolean>;
   getNativeCheckInEnabled(roomId: string): Promise<'True' | 'False' | null>; // null when unreadable
   getNativeCheckInWindow(roomId: string): Promise<number | null>;
   enforceNativeCheckInWindow(roomId: string, windowMinutes: number): Promise<boolean>; // RoomOS accepts 5, 10, 15, 20, 30, 60
   setNativeCheckInEnabled(roomId: string, enabled: boolean): Promise<boolean>; // false on failure; serialized per device (§5.4)
   getCodecTime(roomId: string): Promise<string | null>; // Time.SystemTime with its offset; null when unavailable
+  getUptimeSeconds(roomId: string): Promise<number | null>; // SystemUnit.Uptime (status get); null when unreadable (§5.13)
+  // Early trigger only; never a safety gate. There is no "booted" event (§5.13, §9).
+  onBootEvent(handler: (event: DeviceBootEvent) => void): void;
 }
 
 // --- 5. END-USER NOTIFICATION PORT ---
@@ -341,7 +366,7 @@ export interface RoomActorState {
   currentBooking: BookingDetails | null;
   exemptionStatus: ExemptionClassification;
   isAdHocBookedFromDevice: boolean;
-  wasActiveWhenActorCreated: boolean; // Drives startup quarantine
+  wasActiveWhenActorCreated: boolean; // Drives startup quarantine (also set by a restart after a detected reboot, §5.13)
 
   // Identity-bound policy decision (bound to booking ID + end time)
   autocancellationStatus: AutocancellationStatus;
@@ -357,9 +382,12 @@ export interface RoomActorState {
   // Release Workflow State
   releasePolicy: CancellationReason | null; // 'NoShow' | 'EarlyDeparture'
   promptExpiresAt: Date | null; // Fixed once per warning; never extended by refresh or restoration
-  controllerPromptDisplayed: boolean; // Ownership: set only by a successful display for the current workflow
+  controllerPromptDisplayed: boolean; // Ownership: granted only by the pre- and post-display controller reads (§5.11)
   osdPromptDisplayed: boolean;
-  promptSurfaces: PromptSurfaces | null;
+  controllerIdsAtDisplay: readonly string[] | null; // Controller-ID set captured at the warning display; JIT check 5 compares against it
+  workflowStartedAt: Date | null; // When the current release workflow's countdown started
+  deviceUptimeBaselineSeconds: number | null; // SystemUnit.Uptime read when the countdown started (§5.13)
+  deviceReconcilePending: boolean; // Set by a BootEvent; the next device event runs full reconciliation (§5.13)
   hasUserSelectedKeepBooking: boolean; // Selects REPEATED prompt text
   isAwaitingCheckOutConfirmation: boolean;
   isCheckOutInProgress: boolean;
@@ -375,11 +403,10 @@ export interface RoomActorState {
   automaticCheckInTimer: NodeJS.Timeout | null;
   countdownTimer: NodeJS.Timeout | null;
   warningPromptTimer: NodeJS.Timeout | null;
-  chimeIntervalTimer: NodeJS.Timeout | null;
+  chimeIntervalTimer: NodeJS.Timeout | null; // 60 s tick; also drives the controller and uptime re-reads (§5.11, §5.13)
   volumeRestoreTimer: NodeJS.Timeout | null;
-  surfaceRefreshTimer: NodeJS.Timeout | null; // §5.11, only while a prompt is visible
   readinessRecoveryTimer: NodeJS.Timeout | null;
-  midnightHealthCheckTimer: NodeJS.Timeout | null;
+  midnightHealthCheckTimer: NodeJS.Timeout | null; // Codec-local midnight plus this room's jitter (§5.12)
 
   // Hardware Metadata
   codecTimezoneOffsetMinutes: number | null;
@@ -390,41 +417,44 @@ export interface RoomActorState {
 
 **Scope by mode.** The matrix applies to `DRY_RUN` and `LIVE` actors. `MONITOR_ONLY` actors track presence and availability for utilization only and execute none of the side effects below. In `DRY_RUN`, every device-facing side effect is suppressed and replaced by its dry-run log: no prompt display, clear, restore, or audio; no CheckIn or CheckOut; no `setNativeCheckInEnabled(true)` (the dry-run baseline keeps native CheckIn `False`). Rows marked *LIVE* or *DRY_RUN* apply only in that mode.
 
-**Timing.** The release horizon is `EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS` in `LIVE` and `EMPTY_ROOM_TIMEOUT_MS` in `DRY_RUN`. A countdown may start only when `timeRemaining` is strictly greater than the horizon. The warning deadline is fixed when the warning starts: `PRE_TIMEOUT_WARNING_MS + POST_TIMEOUT_GRACE_PERIOD_MS` (`LIVE`) or `PRE_TIMEOUT_WARNING_MS` (`DRY_RUN`). It is never extended by prompt refresh, controller reconnection, dismissal restoration, or the confirmation guard.
+**Timing.** The release horizon is `EMPTY_ROOM_TIMEOUT_MS + POST_TIMEOUT_GRACE_PERIOD_MS` in `LIVE` and `EMPTY_ROOM_TIMEOUT_MS` in `DRY_RUN`. A countdown may start only when `timeRemaining` is strictly greater than the horizon. The warning deadline is fixed when the warning starts: `PRE_TIMEOUT_WARNING_MS + POST_TIMEOUT_GRACE_PERIOD_MS` (`LIVE`) or `PRE_TIMEOUT_WARNING_MS` (`DRY_RUN`). It is never extended by the chime-tick controller re-read or re-display (§5.11), dismissal restoration, or the confirmation guard.
 
-**Fleet gates.** Before every booking-changing action (automatic CheckIn, countdown start, warning, CheckOut), the coordinator evaluates the kill switch and tripwire (§5.8). When either is active, the row's action is not taken.
+**Fleet gates.** Before every booking-changing action (automatic CheckIn, countdown start, warning, CheckOut), the coordinator evaluates the kill switch and tripwire (§5.8). When either is active, the row's action is not taken. Native CheckIn writes are also withheld; presence baseline and CheckIn window writes still run (§5.12).
+
+**Pending DT1.** Rows that start a No-Show countdown also require, if device test DT1 shows the CheckIn state is readable, a fresh `getCheckInState()` that reports `NotCheckedIn` (§5.9). A `CheckedIn` result records CheckIn confirmation instead; an unreadable state starts no countdown.
 
 | Current Phase | Incoming Event | Guard Condition | Next Phase | Executed Side Effects |
 | :--- | :--- | :--- | :--- | :--- |
-| **Idle** | `BookedUntil` received | Booking was already active when this actor was created (service start, store load, Missing device reappearing, or promotion into `DRY_RUN`/`LIVE`) | **Quarantined** | Status `Blocked / AwaitingStartupCheckIn`. `setNativeCheckInEnabled(false)` (*LIVE*). No automatic CheckIn, countdown, or prompt. |
+| **Idle** | `BookedUntil` received | Booking was already active when this actor was created (service start, store load, Missing device reappearing, promotion into `DRY_RUN`/`LIVE`, or restart after a detected reboot, §5.13) | **Quarantined** | Status `Blocked / AwaitingStartupCheckIn`. `setNativeCheckInEnabled(false)` (*LIVE*). No automatic CheckIn, countdown, or prompt. |
 | **Idle** | `BookedUntil` received | Booking first observed after the actor was created | **Idle** | Start the coalescing buffer (`BOOKING_SYNC_COALESCE_DELAY_MS`). Status `Blocked / VerifyingMeetingLength` (no native CheckIn write). Classify via `getBookingDetails` (§5.3 when the ID or end time is missing). If `BookedFromDevice`, record CheckIn confirmation (§5.9). |
 | **Idle** | Classification complete | Long, unclassifiable, VIP/keyword exempt, or snapshot invalid | **ActiveMeeting** (blocked) | Status `Blocked` with reason. `setNativeCheckInEnabled(false)` (*LIVE*). No automatic CheckIn, countdown, prompt, or CheckOut for this lifecycle. |
 | **Idle** | Classification complete | Eligible; room occupied | **ActiveMeeting** | Status `Allowed`. `setNativeCheckInEnabled(true)` (*LIVE*). Schedule one automatic CheckIn after `AUTOMATIC_CHECK_IN_DELAY_MS` unless CheckIn is already confirmed (§5.9). |
-| **Idle** | Classification complete | Eligible; room empty; no CheckIn confirmation; `timeRemaining > horizon` | **CountdownScheduled** | Status `Allowed`. `setNativeCheckInEnabled(true)` (*LIVE*). New `releaseWorkflowId`. No-Show countdown of `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS`. |
+| **Idle** | Classification complete | Eligible; room empty; no CheckIn confirmation; `timeRemaining > horizon` | **CountdownScheduled** | Status `Allowed`. `setNativeCheckInEnabled(true)` (*LIVE*). New `releaseWorkflowId`. Read `getUptimeSeconds()` as the workflow's uptime baseline (§5.13); unreadable starts no countdown. No-Show countdown of `EMPTY_ROOM_TIMEOUT_MS - PRE_TIMEOUT_WARNING_MS`. |
 | **Idle** | Classification complete | Eligible; room empty; CheckIn confirmed (e.g. `BookedFromDevice`) | **CountdownScheduled** or **ActiveMeeting** | Status `Allowed`. If `EARLY_DEPARTURE_RELEASE_ENABLED` and `timeRemaining > horizon`, start an Early Departure countdown; otherwise no release workflow. |
 | **Idle** | Classification complete | Eligible; room empty; `timeRemaining <= horizon` | **ActiveMeeting** | Log skip (`Ns remaining; requires >Ms`). Booking expires naturally. |
 | **Quarantined** | Any presence event | In quarantine | **Quarantined** | Presence is recorded; no action. No CheckIn, countdown, prompt, or CheckOut. Unknown presence keeps `AwaitingStartupCheckIn` (it never replaces it with a retryable reason). |
-| **Quarantined** | Meeting ends (`Free`/`FreeUntil`) or booking ID changes | — | **Idle** | Quarantine ends with the meeting. Until a verified CheckIn signal exists (§5.9), a quarantined meeting is never released automatically. |
-| **ActiveMeeting** | `PresenceChanged(Empty)` | Allowed; no CheckIn confirmation | **CountdownScheduled** | Cancel pending automatic CheckIn. Start No-Show countdown when `timeRemaining > horizon`. |
-| **ActiveMeeting** | `PresenceChanged(Empty)` | Allowed; CheckIn confirmed; `EARLY_DEPARTURE_RELEASE_ENABLED` | **CountdownScheduled** | Start Early Departure countdown when `timeRemaining > horizon`. |
+| **Quarantined** | Meeting ends (`Free`/`FreeUntil`) or booking ID changes | — | **Idle** | Quarantine ends with the meeting. Nothing lifts it early, and a quarantined meeting is never released automatically (§5.9). |
+| **ActiveMeeting** | `PresenceChanged(Empty)` | Allowed; no CheckIn confirmation | **CountdownScheduled** | Cancel pending automatic CheckIn. Start No-Show countdown when `timeRemaining > horizon`, with a fresh uptime baseline (§5.13). |
+| **ActiveMeeting** | `PresenceChanged(Empty)` | Allowed; CheckIn confirmed; `EARLY_DEPARTURE_RELEASE_ENABLED` | **CountdownScheduled** | Start Early Departure countdown when `timeRemaining > horizon`, with a fresh uptime baseline (§5.13). |
 | **ActiveMeeting** | `PresenceChanged(Empty)` | CheckIn confirmed; Early Departure disabled | **ActiveMeeting** | Log only. No release workflow. |
 | **ActiveMeeting** | `PresenceChanged(Occupied)` | Allowed | **ActiveMeeting** | Schedule automatic CheckIn if not yet attempted this lifecycle. |
-| **ActiveMeeting** | Automatic CheckIn timer fires | Revalidated: same lifecycle and booking ID, `BookedUntil`, future end time, occupied, Allowed, not confirmed | **ActiveMeeting** | *LIVE:* `checkIn(roomId, bookingId, 'BookingAutoCancellation_Automatic')`; `CheckedIn` or `AlreadyCheckedIn` records CheckIn confirmation (§5.9); `Failed` is logged and never retried, and does not block a later No-Show. *DRY_RUN:* log `[DRY RUN - INTENT_TO_AUTOMATIC_CHECK_IN]` and `[DRY RUN - SIMULATED_CHECK_IN]`, set `dryRunSimulatedCheckInBookingId`. |
+| **ActiveMeeting** | Automatic CheckIn timer fires | Revalidated: same lifecycle and booking ID, `BookedUntil`, future end time, occupied, Allowed, not confirmed | **ActiveMeeting** | *LIVE:* `checkIn(roomId, bookingId, 'BookingAutoCancellation_Automatic')`; `CheckedIn` or `AlreadyCheckedIn` records CheckIn confirmation (§5.9; treating `AlreadyCheckedIn` as confirmation is an intentional difference, §5.14); `Failed` is logged and never retried, and does not block a later No-Show. *DRY_RUN:* log `[DRY RUN - INTENT_TO_AUTOMATIC_CHECK_IN]` and `[DRY RUN - SIMULATED_CHECK_IN]`, set `dryRunSimulatedCheckInBookingId`. |
 | **CountdownScheduled** | `PresenceChanged(Occupied)` | Any | **ActiveMeeting** | Cancel countdown, invalidate `releaseWorkflowId`, schedule automatic CheckIn. |
 | **CountdownScheduled** | Countdown timer fires | *DRY_RUN*; workflow ID current | **PromptPending** | Log `[DRY RUN - WOULD_DISPLAY_PROMPT]` and `[DRY RUN - WOULD_SEND_EMAIL]` (the simulated email satisfies the email gate). Arm the deadline (`PRE_TIMEOUT_WARNING_MS`). No display, audio, or email. |
-| **CountdownScheduled** | Countdown timer fires | *LIVE*; workflow ID current | **PromptVisible** | Fix the warning deadline. `refreshPromptSurfaces()`, then display the warning on the controller and OSD (`INITIAL`, or `REPEATED` after a prior Keep Booking). `playAudioAlert()` and start the 60s chime loop (sound failure is logged and ignored). Start the surface refresh (§5.11). `sendCancellationWarning()` for this deadline (§5.8). If no actionable surface accepted the prompt, log it and keep the deadline so a reconnecting controller receives the remaining time; expiry then preserves the booking. |
+| **CountdownScheduled** | Countdown timer fires | *LIVE*; workflow ID current | **PromptVisible** | Fix the warning deadline. `readPromptSurfaces()`, then display the warning with `Target=Controller` (always) and on the OSD per platform rules (`INITIAL`, or `REPEATED` after a prior Keep Booking). Grant controller ownership and capture `controllerIdsAtDisplay` only if the pre-display read found a controller and a re-read after the display resolves still finds it (§5.11). `playAudioAlert()` and start the 60s chime loop (sound failure is logged and ignored). `sendCancellationWarning()` for this deadline (§5.8). If no actionable surface owns the prompt, log it and keep the deadline; expiry then preserves the booking. |
 | **PromptPending** | `PresenceChanged(Occupied)` | *DRY_RUN* | **ActiveMeeting** | Cancel the simulated warning, invalidate the workflow, schedule the (simulated) automatic CheckIn. |
 | **PromptPending** | Deadline reached | *DRY_RUN* | **ValidatingJIT** | Run release validation (§5.5) without the actionable-surface check. |
-| **PromptVisible** | `PromptResponse` option 1 (Keep Booking) | Response matches an owned, visible actionable prompt | **ActiveMeeting** | Set `hasUserSelectedKeepBooking`. `clearPrompts('all')`, stop chime, restore volume, invalidate workflow. Re-read presence: `Empty` starts a fresh countdown (later warning uses `REPEATED` text); `Occupied` schedules automatic CheckIn; `Unknown` or failure suspends autocancellation. |
+| **PromptVisible** | `PromptResponse` option 1 (Keep Booking) | Response `FeedbackId` matches the current workflow's visible prompt, including a re-displayed one (§5.11) | **ActiveMeeting** | Set `hasUserSelectedKeepBooking`. `clearPrompts('all')`, stop chime, restore volume, invalidate workflow. Re-read presence: `Empty` starts a fresh countdown (later warning uses `REPEATED` text); `Occupied` schedules automatic CheckIn; `Unknown` or failure suspends autocancellation. |
 | **PromptVisible** | `PromptResponse` option 2 (Check Out) | Owned warning prompt | **PromptVisible** (confirmation guard) | Set `isAwaitingCheckOutConfirmation`. `clearPrompts('warning')` only, then display the confirmation prompt for the remaining deadline. |
 | **PromptVisible** (guard) | Confirmation option 2 (Check out) | Owned confirmation prompt; fleet gates clear | **Released** | Set `isCheckOutInProgress`. Re-read the booking snapshot (`BookedUntil`, same booking ID). Mark pending service CheckOut, then `checkOut(roomId, bookingId, 'UserConfirmed')`. No cancellation notice email. Failure: `Blocked / CheckOutFailed`. |
 | **PromptVisible** (guard) | Confirmation option 1 (Cancel) | Owned confirmation prompt | **ActiveMeeting** | Same as Keep Booking. |
 | **PromptVisible** | `PromptCleared`, or a response without a recognized option | Dismissed target is owned (warning or confirmation); no CheckOut in progress | **PromptVisible** | `restoreDismissedPrompt(target, currentPrompt)` for that target only, with the remaining duration. Deadline unchanged. Chime continues. No new warning email. |
 | **PromptVisible** | `PresenceChanged(Occupied)` | Prompt visible | **PromptVisible** | **Retain the prompt** so occupants can read and act on it. Automatic CheckIn is deferred until Keep Booking or expiry. |
 | **PromptVisible** | Stale or unmatched `PromptResponse` | No owned prompt matches | **(unchanged)** | Log `ignored`. No workflow change. |
+| **PromptVisible** | 60s chime tick | Workflow ID current | **PromptVisible** | `playAudioAlert()`. Re-read `readPromptSurfaces()`: if the controller-ID set changed or the read failed, drop controller ownership and, if this workflow captured a set at display and a controller is now present, re-display the current prompt with the remaining duration only (§5.11). Re-read `getUptimeSeconds()`; a detected reboot follows the reboot row below. The deadline never moves. |
 | **PromptVisible** | Warning email fails (after bounded retries) or the organizer email is missing | Notifications enabled | **PromptVisible** | Set `warningEmailFailed` (lifecycle-scoped, never recovered automatically). Keep the prompt so occupants can still act. Automatic release is blocked at expiry; no new countdown starts for this lifecycle. |
 | **PromptVisible** | Deadline reached | Unconfirmed confirmation guard | **ActiveMeeting** / **PromptVisible** | Abort (`unconfirmed_user_checkout_guard`), clear prompts, preserve booking. Re-read presence: `Empty` and still eligible restores the original warning with a full new deadline (no new pre-warning countdown; a new warning email is sent for the new deadline); otherwise preserve without a warning. |
-| **PromptVisible** | Deadline reached | No confirmation guard | **ValidatingJIT** | Halt chime loop and surface refresh. Run the JIT verification probe (§5.5). |
+| **PromptVisible** | Deadline reached | No confirmation guard | **ValidatingJIT** | Halt the chime loop. Run the JIT release validation (§5.5). |
 | **ValidatingJIT** | Every JIT check passes | — | **Released** | *LIVE:* mark pending service CheckOut, then `checkOut(roomId, bookingId, releasePolicy)`; `clearPrompts('all')`; dispatch `sendCancellationNotice()` with the policy reason. *DRY_RUN:* log `[DRY RUN - WOULD_RELEASE]`; no command. |
 | **ValidatingJIT** | Presence `Occupied` | Late entry | **ActiveMeeting** | Abort (`room_not_confirmed_empty`), clear prompts, preserve booking, schedule automatic CheckIn. |
 | **ValidatingJIT** | Any other JIT check fails | See §5.5 | **ActiveMeeting** | Abort, preserve booking, log `ReleaseAbortedPreserved` with the validation reason. Prompts are cleared only for the checks listed in §5.5. |
@@ -433,8 +463,12 @@ export interface RoomActorState {
 | **Any** | Availability becomes `Free` / `FreeUntil` | Any | **Idle** | New lifecycle; cancel all timers; clear prompts; `setNativeCheckInEnabled(true)` (*LIVE*). If a known booking ended before its scheduled end and was not the service's own pending CheckOut, log `[EXTERNAL_RELEASE_OBSERVED]`. A `FreeUntil` timestamp is the next booking start, never a current end. A completed release (`Released`) also returns here. |
 | **Any** | Current booking ID changes | Rollover | **Idle** (new lifecycle) | Cancel old timers and prompts, reset per-lifecycle CheckIn and email state, then evaluate the new booking as first observed after the actor was created. |
 | **Any** | Booking end time changes during countdown or prompt | Fresh classification is long or unclassifiable | **ActiveMeeting** (blocked) | Clear prompts, cancel timers, invalidate workflow, `setNativeCheckInEnabled(false)` (*LIVE*), log suspension. |
-| **Any** | Midnight health check (codec-local) | Validation succeeds | **(unchanged)** | Keep an active valid workflow without duplicating timers; reschedule the next midnight check. |
-| **Any** | Midnight health check | Validation fails | **ActiveMeeting** (blocked) | Cancel the workflow and prompts, preserve the booking, wait for event-driven recovery. |
+| **Any** | Midnight health check (codec-local midnight plus this room's jitter) | — | **(evaluated next)** | First apply the mode's configuration writes (§5.12): presence baseline and CheckIn window, `Enabled=False` in *DRY_RUN*, and the §5.6 policy in *LIVE*. Then re-verify configuration, presence, booking snapshot, and codec time. |
+| **Any** | Midnight health check | Writes and validation succeed | **(unchanged)** | Keep an active valid workflow without duplicating timers; reschedule the next midnight check. |
+| **Any** | Midnight health check | A write or validation fails | **ActiveMeeting** (blocked) | Cancel the workflow and prompts, preserve the booking, wait for event-driven recovery (§5.3). |
+| **Any** | Readiness recovery attempt, ingress reconnect, or lease re-acquire | — | **(evaluated next)** | Same order as midnight: the mode's configuration writes first, then full revalidation (§5.3, §5.12). Failure keeps the transient block and preserves the booking. |
+| **Any** | Device reboot detected: `SystemUnit.Uptime` decreased below the baseline, or is less than the workflow's age | A release workflow is active | **Quarantined** or **Idle** | Abort (`device_rebooted_during_workflow`), invalidate and cancel the workflow, clear prompts, preserve the booking. Restart the actor with startup semantics: an in-progress meeting is quarantined until it ends (`setNativeCheckInEnabled(false)` *LIVE*), then full reconciliation (§5.12, §5.13). |
+| **Any** | `BootEvent` (`Restart`, `Shutdown`, `Upgrade`) | Any | **(unchanged)** or **ActiveMeeting** | Early trigger only: cancel any active workflow, clear prompts (best effort), restore volume, preserve the booking, set `deviceReconcilePending`. The next device event or read runs the uptime check and full reconciliation (§5.13). Never a safety gate. |
 
 ---
 
@@ -451,6 +485,7 @@ sequenceDiagram
     participant Interaction as IRoomInteractionDriver
     participant Notify as INotificationDriver
     participant Calendar as ICalendarDriver
+    participant Device as IDeviceConfigDriver
     participant Smtp as Corporate SMTP Relay
 
     Poller->>Coordinator: Status Bookings.Availability BookedUntil (Meeting Starts)
@@ -459,15 +494,17 @@ sequenceDiagram
     Calendar-->>Coordinator: BookingDetails (Duration 30m, Standard)
     Coordinator->>Presence: getPresence(roomId)
     Presence-->>Coordinator: Empty
+    Coordinator->>Device: getUptimeSeconds(roomId) (workflow uptime baseline)
+    Device-->>Coordinator: Uptime
 
     Note over Coordinator: Phase = CountdownScheduled<br/>Empty-room timer running
 
     Note over Coordinator: EMPTY_ROOM_TIMEOUT - PRE_TIMEOUT_WARNING elapsed<br/>Deadline fixed at warning + grace
-    Coordinator->>Interaction: refreshPromptSurfaces(roomId)
-    Interaction-->>Coordinator: Controller connected
+    Coordinator->>Interaction: readPromptSurfaces(roomId) (pre-display)
+    Interaction-->>Coordinator: Controller IDs [A]
 
     par In-Room Warning and Audio Alert
-        Coordinator->>Interaction: displayPrompt(roomId, WarningPrompt, surfaces)
+        Coordinator->>Interaction: displayPrompt(roomId, WarningPrompt, surfaces) (Target=Controller)
         Coordinator->>Interaction: playAudioAlert(roomId) (Vol 70, coordinator restores after 4s)
     and Mandatory Warning Email
         Coordinator->>Notify: sendCancellationWarning(Payload for this deadline)
@@ -476,18 +513,25 @@ sequenceDiagram
         Notify-->>Coordinator: NotificationResult (success)
     end
 
-    Note over Coordinator: Phase = PromptVisible<br/>60s chime loop and surface refresh active
+    Coordinator->>Interaction: readPromptSurfaces(roomId) (post-display)
+    Interaction-->>Coordinator: Controller IDs [A]
+    Note over Coordinator: Ownership granted, controllerIdsAtDisplay = [A]
+
+    Note over Coordinator: Phase = PromptVisible<br/>60s chime loop: alert, controller re-read, uptime re-read
 
     Note over Coordinator: Deadline reached
     Coordinator->>Coordinator: Phase = ValidatingJIT
-    Coordinator->>Presence: getPresence(roomId) (Synchronous JIT Probe)
+    Coordinator->>Presence: getPresence(roomId) (JIT read)
     Presence-->>Coordinator: Empty
-    Coordinator->>Interaction: refreshPromptSurfaces(roomId) (prompt ownership still actionable)
-    Interaction-->>Coordinator: Controller connected
-    Coordinator->>Calendar: getAvailability(roomId) (Synchronous JIT Probe)
+    Coordinator->>Interaction: readPromptSurfaces(roomId) (JIT check 5)
+    Interaction-->>Coordinator: Controller IDs [A] (same set as at display)
+    Coordinator->>Calendar: getAvailability(roomId) (JIT read)
     Calendar-->>Coordinator: BookedUntil (Booking ID Unaltered)
     Coordinator->>Calendar: getBookingDetails(roomId, bookingId) (Fresh reclassification)
     Calendar-->>Coordinator: BookingDetails (still short, end time unchanged)
+    Coordinator->>Device: getUptimeSeconds(roomId) (JIT check 11)
+    Device-->>Coordinator: Uptime consistent with baseline (no reboot)
+    Note over Coordinator: JIT check 12 (CheckIn state read) only if DT1 confirms it exists
 
     Note over Coordinator: Mark pending service CheckOut
     Coordinator->>Calendar: checkOut(roomId, bookingId, 'NoShow')
@@ -584,7 +628,7 @@ sequenceDiagram
         Coordinator->>Interaction: clearPrompts(roomId, 'all')
         Coordinator->>Interaction: restoreAudioVolume(roomId)
         Note over Coordinator: Phase = ActiveMeeting<br/>Booking preserved, no further countdown this lifecycle
-    else Abort Scenario B - Occupant Enters Room at Deadline (JIT Probe Fail)
+    else Abort Scenario B - Occupant Enters Room at Deadline (JIT Check 4 Fails)
         Note over Coordinator: Deadline reached
         Coordinator->>Coordinator: Phase = ValidatingJIT
         Coordinator->>Presence: getPresence(roomId) (Synchronous Real-Time Read)
@@ -643,7 +687,7 @@ function onAvailabilityChanged(actor: RoomWorkflowCoordinator): void {
 
 When the current booking is blocked by a transient reason (`RequiredConfigurationsUnavailable`, `RoomUseStatusUnavailable`, `CouldNotVerifyCurrentBooking`, `NativeCheckInSettingUnavailable`, `CodecTimeUnavailable`, or a native CheckIn write that has not yet applied), the coordinator runs one bounded recovery sequence on delays of `BOOKING_READINESS_RECOVERY_DELAYS_MS` (default `[250ms, 500ms, 1000ms, 2000ms, 4000ms]`):
 
-- Every attempt rebuilds the full snapshot (configuration health, presence, availability, booking identity, codec time). When the booking ID is known but the end time is missing, it uses `getBookingDetails()` (`Bookings.Get({ Id })`). When the ID is missing, it uses `getCurrentBooking()` (`Bookings.List({ ScheduleType: 'Current', Limit: 1 })`). The returned identity and ordered future schedule are validated before policy evaluation.
+- Every attempt first applies the room mode's configuration writes (§5.12), as the macro's `reconcileAutocancellationReadiness()` does, and then rebuilds the full snapshot (configuration health, presence, availability, booking identity, codec time). When the booking ID is known but the end time is missing, it uses `getBookingDetails()` (`Bookings.Get({ Id })`). When the ID is missing, it uses `getCurrentBooking()` (`Bookings.List({ ScheduleType: 'Current', Limit: 1 })`). The returned identity and ordered future schedule are validated before policy evaluation.
 - The sequence is cancelled by a valid readiness result or a lifecycle change. It captures the booking lifecycle and status-event version before its first read and discards the snapshot if either changes.
 - Recovery never clears `AwaitingStartupCheckIn` and never guesses missing data. Deliberate blocks (`LongMeeting`, VIP/keyword exemptions, `CheckOutFailed`) and `warningEmailFailed` do not schedule recovery.
 - Exhaustion preserves the booking (status stays `Blocked / CouldNotVerifyCurrentBooking` or the original transient reason) and waits for the next relevant room event or the midnight health check. It never becomes an unbounded polling loop.
@@ -668,7 +712,7 @@ Each queued write rechecks the booking lifecycle and status-event version before
 
 ### 5.5 Just-In-Time (JIT) Release Validation Checklist
 
-At warning-deadline expiry, every check below must pass, in order, before `checkOut()`. The checks mirror the codec-native `validateReleaseBeforeCheckOut()`. Gates 9 and 10 are service-only and can only block. Every failure preserves the booking and logs the reason. The **Clears prompts** column follows the macro: a stale or not-ready check returns without touching surfaces, so it can never clear a newer workflow's prompt.
+At warning-deadline expiry, every check below must pass, in order, before `checkOut()`. Checks 1 to 8 mirror the codec-native `validateReleaseBeforeCheckOut()`; check 5 is stricter than the macro (§5.11). Checks 9, 10, and 11 are service-only and can only block. Check 12 stands in for the macro's `Bookings.CheckedIn` knowledge and exists only if device test DT1 confirms the CheckIn state is readable (§5.9). Every failure preserves the booking and logs the reason. The **Clears prompts** column follows the macro: a stale or not-ready check returns without touching surfaces, so it can never clear a newer workflow's prompt.
 
 | # | Check | Failure reason | Clears prompts |
 | :--- | :--- | :--- | :--- |
@@ -676,12 +720,14 @@ At warning-deadline expiry, every check below must pass, in order, before `check
 | 2 | No unconfirmed Check Out confirmation guard (then the restore rule in §3.2 applies) | `unconfirmed_user_checkout_guard` | Yes |
 | 3 | Presence is supported and the autocancellation status is `Allowed` | `presence_unsupported`, `autocancellation_not_ready` | No |
 | 4 | A fresh `getPresence()` returns `Empty` (`Occupied` also schedules automatic CheckIn) | `room_not_confirmed_empty` | Yes |
-| 5 | *LIVE only:* `refreshPromptSurfaces()`, then a controller (still connected) or an interactive OSD owns the displayed prompt. An unreadable inventory invalidates controller ownership. `DRY_RUN` skips this check | `no_actionable_prompt_surface` | Yes |
+| 5 | *LIVE only:* a fresh `readPromptSurfaces()`, then either the workflow still holds controller ownership and the read is readable (not failed, not `403`), shows at least one controller, and returns exactly the `controllerIdsAtDisplay` set; or an interactive OSD owns the displayed prompt. `DRY_RUN` skips this check | `no_actionable_prompt_surface` | Yes |
 | 6 | A fresh `getAvailability()` returns `BookedUntil` with the same booking ID and a future end time | `current_booking_snapshot_invalid` | Yes |
 | 7 | A fresh `getBookingDetails()` reclassifies the booking as eligible, with an ID and end time that still match | `current_booking_policy_invalid` | Yes |
 | 8 | Lifecycle and workflow IDs are rechecked after every awaited call; a valid Keep Booking received while validation is in flight invalidates the workflow | `stale_release_workflow` | No |
 | 9 | Service-only gates: kill switch off and tripwire not tripped (§5.8); warning email covered the current deadline, or `NOTIFICATIONS_ENABLED=false` (in `DRY_RUN`, the `[DRY RUN - WOULD_SEND_EMAIL]` entry counts); `warningEmailFailed` is not set; room mode is `LIVE` or `DRY_RUN` | `fleet_gate_closed`, `warning_email_not_delivered` | Yes |
 | 10 | VIP organizer and title keyword exemptions are re-evaluated against the fresh booking details | `current_booking_policy_invalid` | Yes |
+| 11 | A fresh `getUptimeSeconds()` is readable, not lower than `deviceUptimeBaselineSeconds`, and not less than the workflow's age (§5.13). A detected reboot also restarts the actor with startup semantics | `device_rebooted_during_workflow`, `device_uptime_unavailable` | Yes |
+| 12 | *PENDING DT1; No-Show policy only:* a fresh `getCheckInState()` reports `NotCheckedIn`. `CheckedIn` records CheckIn confirmation; unreadable fails closed. Removed if DT1 shows the state is not exposed | `booking_checked_in`, `checkin_state_unavailable` | Yes |
 
 Only after every check passes: `LIVE` marks the pending service CheckOut and issues `checkOut()`; `DRY_RUN` logs `[DRY RUN - WOULD_RELEASE]`.
 
@@ -698,8 +744,9 @@ The identity-bound autocancellation status solely owns `Bookings.CheckIn.Enabled
 
 - **CheckOut requires native CheckIn.** RoomOS executes `Bookings.CheckOut` only while `Bookings.CheckIn.Enabled = True`. A CheckOut is therefore issued only for an `Allowed` booking whose `True` write has been applied.
 - **Failures.** A failed enable while moving to `Allowed` records `Blocked / NativeCheckInSettingUnavailable`. A failed disable keeps the existing block reason and is retried by readiness recovery.
-- **Fleet gates make no write.** The kill switch and tripwire (§5.8) never change a booking's status, so activating or clearing them never triggers native CheckIn writes across the fleet.
-- **DRY_RUN.** On actor start, read `Bookings.CheckIn.Enabled` and write `False` only when it is enabled, failing closed if it cannot be read or written. The service never enables native CheckIn in `DRY_RUN`.
+- **Fleet gates make no write.** The kill switch and tripwire (§5.8) never change a booking's status, so activating or clearing them never triggers native CheckIn writes across the fleet. While either is active, no native CheckIn write is made at all, including by the re-apply below.
+- **Re-apply.** Midnight, readiness recovery, ingress reconnect, and lease re-acquire re-run this policy for the current status (§5.12). They never write `Enabled` blindly: the value always comes from the table above.
+- **DRY_RUN.** On actor start, and again at every re-apply (§5.12), read `Bookings.CheckIn.Enabled` and write `False` only when it is enabled, failing closed if it cannot be read or written. The service never enables native CheckIn in `DRY_RUN`.
 - **MONITOR_ONLY.** No native CheckIn write and no other device write. The room's own baseline stays in force (§5.7).
 
 ### 5.7 Operating Mode Transitions
@@ -722,7 +769,7 @@ Demotion (admin; the system may only demote to DISABLED):
 | `DISABLED` or `MONITOR_ONLY` | `DRY_RUN` | Create the actor if needed. Before the first device write, read `Bookings.CheckIn.Enabled` and `Bookings.CheckIn.WindowDuration` and store them as `nativeCheckInBaseline` in the roster entry (once, unless already recorded). Apply the dry-run presence baseline, CheckIn window, and native CheckIn writes. If a booking is in progress, quarantine it (`Blocked / AwaitingStartupCheckIn`) exactly as at service startup: the service has never managed this meeting, so it must not treat it as a no-show. The quarantine lasts until the meeting ends (§5.9). |
 | `DRY_RUN` | `LIVE` | Quarantine any in-progress booking (`AwaitingStartupCheckIn`). A dry-run simulated CheckIn never carries over as confirmation. Re-run the native CheckIn policy for the current status (§5.6). |
 | `LIVE` | `DRY_RUN` | Cancel any active workflow and clear prompts. Quarantine any in-progress booking. Apply the dry-run native CheckIn baseline (`False`). |
-| `DRY_RUN` or `LIVE` | `MONITOR_ONLY` or `DISABLED` | New `releaseWorkflowId`; cancel the countdown, prompt, chime, automatic CheckIn, surface refresh, and recovery timers; clear both prompt surfaces and restore volume (`LIVE` only). Restore `Bookings.CheckIn.Enabled` and `Bookings.CheckIn.WindowDuration` to the recorded `nativeCheckInBaseline`, so the room's native no-show behavior returns to what it was before enrollment. The RoomAnalytics presence settings are left as written (they are non-intrusive sensor inputs). These clean-up writes are the last the service makes. A failed clean-up write is logged, recorded in the audit log, and surfaced on the dashboard as `CleanupIncomplete`; it is not retried in the background. |
+| `DRY_RUN` or `LIVE` | `MONITOR_ONLY` or `DISABLED` | New `releaseWorkflowId`; cancel the countdown, prompt, chime, automatic CheckIn, and recovery timers; clear both prompt surfaces and restore volume (`LIVE` only). Restore `Bookings.CheckIn.Enabled` and `Bookings.CheckIn.WindowDuration` to the recorded `nativeCheckInBaseline`, so the room's native no-show behavior returns to what it was before enrollment. The RoomAnalytics presence settings are left as written (they are non-intrusive sensor inputs). These clean-up writes are the last the service makes. A failed clean-up write is logged, recorded in the audit log, and surfaced on the dashboard as `CleanupIncomplete`; it is not retried in the background. |
 | `MONITOR_ONLY` | `DISABLED` | No device writes are needed. |
 | Any | `DISABLED` | After the clean-up above, tear down the actor (`teardown()` clears every timer) and unregister it. From then on, every event for the device is discarded at the ingress gate (§7.1). |
 
@@ -735,7 +782,8 @@ Demotion (admin; the system may only demote to DISABLED):
 - Every active countdown, simulated warning, and visible prompt is cancelled: the workflow ID is invalidated, prompts are cleared, the chime stops, and volume is restored (`LIVE`). The booking is preserved.
 - No new countdown, prompt, warning email, or automatic CheckIn starts.
 - No CheckOut is issued, including a user-confirmed Check Out.
-- No native CheckIn write is made on activation or on deactivation. Booking statuses do not change, which avoids a fleet-wide configuration write storm.
+- No native CheckIn write is made on activation, on deactivation, or while active (including the midnight and recovery re-apply). Booking statuses do not change, which avoids a fleet-wide configuration write storm.
+- Presence baseline and `Bookings.CheckIn.WindowDuration` writes at midnight and recovery (§5.12) still run: they never change a booking, and they keep the room ready for when automation resumes.
 - After deactivation, rooms resume on their next relevant event or midnight health check. Nothing restarts in bulk.
 - `DRY_RUN` simulated releases do not count toward the tripwire; only real `LIVE` CheckOuts do.
 
@@ -748,18 +796,22 @@ Demotion (admin; the system may only demote to DISABLED):
 
 ### 5.9 CheckIn Confirmation Without `Bookings.CheckedIn`
 
-The macro learns about CheckIns from `xapi.Event.Bookings.CheckedIn`. **That event is not delivered to Workspace Integrations** (it is absent from the list of supported subscriptions, §9). The service therefore uses only signals it can observe, and fails closed where none exists:
+The macro learns about CheckIns from `xapi.Event.Bookings.CheckedIn`. **That event is not delivered to Workspace Integrations** (it is absent from the list of supported subscriptions, §9). There is no relay macro on the device and no CheckIn "test" command: the service never issues a command only to discover CheckIn state. It uses only signals it can observe, and fails closed where none exists:
 
 | Signal | Effect |
 | :--- | :--- |
-| The service's own `Bookings.CheckIn` returns success | CheckIn confirmed for that booking (`checkInConfirmedBookingId`). Selects Early Departure (if enabled) on later vacancy. |
-| The service's CheckIn returns `Cannot check in booking that is already checked in.` | Someone else already checked in; CheckIn confirmed. Logged as informational. |
-| `BookedFromDevice = True` from `Bookings.Get` | RoomOS checks ad hoc bookings in natively on creation; CheckIn confirmed without sending a command. Prevents an ad hoc booking from entering No-Show. |
+| The service's own automatic `Bookings.CheckIn` returns success | CheckIn confirmed for that booking (`checkInConfirmedBookingId`). Selects Early Departure (if enabled) on later vacancy. |
+| The service's automatic CheckIn returns the "already checked in" error | Someone or something already checked in; CheckIn confirmed and logged as informational. The adapter classifies it by substring (§2.2); the exact text over SSH and the cloud is pending device test DT2. This is how the service learns about RoomOS native check-in (§9: sustained people count, call joined, sharing, ad hoc, `AutoCheckInDuration`) and about a manual panel check-in in an occupied room. Treating it as confirmation is an intentional difference (§5.14). |
+| `BookedFromDevice = True` from `Bookings.Get` | RoomOS checks ad hoc bookings in natively on creation; CheckIn confirmed without sending a command, and no automatic CheckIn is scheduled. The service always calls `getBookingDetails()`, so this flag is always populated; the macro skips `Bookings.Get` when the long-meeting threshold is `0` (§5.14). |
+| *PENDING DT1:* `getCheckInState()` reports `CheckedIn` | CheckIn confirmed. A read-only status read with no side effects. |
 | `DRY_RUN` simulated automatic CheckIn | Policy selection only (`dryRunSimulatedCheckInBookingId`); never clears quarantine. |
 
-- **Startup quarantine has no release signal.** A booking already active when the actor was created stays `Blocked / AwaitingStartupCheckIn` until it ends (`Free`/`FreeUntil` or a booking ID change). It is never automatically released and receives no automatic CheckIn, countdown, or prompt. This is stricter than the macro, which lifts quarantine on a matching `CheckedIn` event.
-- **Known residual difference.** A manual CheckIn on the room panel is visible to the service only through its own automatic CheckIn attempt (the `AlreadyCheckedIn` result). That attempt runs once the room is occupied for `AUTOMATIC_CHECK_IN_DELAY_MS`.
-- **Open codec test.** Whether `Bookings.Get` or `Bookings.List` expose a booking's CheckIn state, and whether the cloud xCommand returns the same `already checked in` error text, must be verified on a real codec. If the CheckIn state is exposed, a later revision may use it to lift quarantine and to recognize manual CheckIns. Until then, the rules above apply.
+- **Startup quarantine has no release signal.** A booking already active when the actor was created (or when it restarted after a detected reboot, §5.13) stays `Blocked / AwaitingStartupCheckIn` until it ends (`Free`/`FreeUntil` or a booking ID change). Native CheckIn stays `False` in `LIVE`. It is never automatically released and receives no automatic CheckIn, countdown, or prompt, and nothing lifts it early. This is stricter than the macro, which lifts quarantine on a matching `CheckedIn` event.
+- **CheckIn state read (pending DT1).** If device test DT1 shows that `Bookings.Get`, `Bookings.List`, or an xStatus exposes a booking's CheckIn state, the service reads it at exactly two points:
+  1. When an empty room would start a No-Show countdown. `CheckedIn` records confirmation: no countdown, prompt, or email, exactly like the macro (Early Departure applies if enabled). An unreadable state starts no countdown and preserves the booking.
+  2. As JIT check 12 before a No-Show CheckOut (§5.5).
+- **Residual gap if DT1 is negative.** An empty room has no occupant, so the service's automatic CheckIn never runs (it needs `AUTOMATIC_CHECK_IN_DELAY_MS` of occupancy) and returns no `AlreadyCheckedIn` result. If someone checks in on a panel (for example, a scheduler Navigator outside the door) and the room then stays empty for the full timeout, the service cannot see that check-in: it runs the countdown, shows the prompt, sends the warning email, and releases the booking if nobody answers. The macro would start no countdown. This is the one accepted case where the service can release a booking the macro would keep. It is mitigated by the in-room prompt and by the conditional warning-email wording (§6.2). Every other check-in path is still covered by RoomOS native check-in and the service's own CheckIn result.
+- **Device tests.** DT1 (CheckIn state readable) decides between the read and the documented gap. DT2 (exact already-checked-in error over SSH and the cloud) fixes the adapter's classification. Both are part of the Sprint 1 ticket 05 spike.
 
 ### 5.10 Settings Validation
 
@@ -773,15 +825,58 @@ Every settings write from the dashboard is validated before it is persisted. Inv
 
 A changed timing applies only to workflows started after the change. Running countdowns and fixed warning deadlines keep the values they started with.
 
-### 5.11 Prompt Surface Refresh (Polling Instead of Topology Events)
+### 5.11 Controller Prompt Surfaces (Just-In-Time Reads, No Topology Events)
 
-The macro reacts to `Peripherals.ConnectedDevice` change events. Workspace Integrations cannot subscribe to controller topology (§9), so the service reads it on demand with `refreshPromptSurfaces()`:
+The macro reacts to `Peripherals.ConnectedDevice` change events. Workspace Integrations cannot subscribe to controller topology (§9). The service assumes a Navigator controller exists and reads the topology with `readPromptSurfaces()` only at fixed points of a workflow. There is no listener and no separate polling timer.
 
-- Before displaying any warning or confirmation prompt.
-- Every `PROMPT_SURFACE_REFRESH_INTERVAL_MS` (30 s) while a prompt is visible. This is bounded by the warning deadline, so it is never an open-ended poll.
-- At JIT check 5.
+1. **Display.** Every warning and confirmation prompt is sent with `Target=Controller`, plus the OSD per the platform rules, whether or not a controller was found. Controller ownership (`controllerPromptDisplayed`) is granted only if the read just before the display found at least one connected `TouchPanel` with `Role=Controller` (`RoomScheduler` excluded) and a re-read after the display resolves still finds it. The warning display captures that controller-ID set in `controllerIdsAtDisplay`; the confirmation prompt is displayed the same way and does not replace the captured set.
+2. **Each 60 s chime tick while a prompt is visible.** Re-read the topology. If the controller-ID set changed or the read failed, drop controller ownership. If this workflow captured a set at display and a controller is now present, re-display the current prompt there with the remaining duration only. The deadline never moves.
+3. **JIT check 5** (§5.5). Release is blocked, and prompts cleared, if the read fails, returns `403`, shows zero controllers, or shows a controller-ID set different from `controllerIdsAtDisplay`.
 
-A refresh that finds a newly connected controller displays the current prompt there with the remaining duration. A controller that disconnected loses prompt ownership, and its prompt is cleared. An unreadable inventory invalidates controller ownership. None of these refreshes restarts or extends the deadline. A prompt display that completes after its workflow was cancelled, or after controller availability changed, is cleared and never re-owned; if the target now belongs to a newer prompt, that prompt is re-displayed.
+- **User intent versus automatic release.** A `Prompt.Response` whose `FeedbackId` matches the current workflow's prompt (with its `Origin`) proves user intent. Keep Booking, Cancel, and the user-confirmed Check Out are honored for the current workflow, including on a re-displayed prompt. A response never authorizes an automatic release: after any change in the controller-ID set, automatic release stays blocked by check 5.
+- **No late ownership.** A controller that connects mid-prompt in a room that had none at display is not given the prompt, and the booking is kept at expiry (§5.14).
+- **Stale displays.** A prompt display that completes after its workflow was cancelled is cleared and never re-owned; if the target now belongs to a newer prompt, that prompt is re-displayed.
+- **Interactive OSD.** A Desk Pro's own OSD prompt is owned through `osdPromptDisplayed` and satisfies check 5 on its own.
+- **Pending device tests.** DT3 (`Prompt.Display Target=Controller` with no controller connected) and DT5 (`Prompt.Cleared` and `ConnectedDevice` when a Navigator reboots mid-prompt) confirm the device behavior these rules assume. Until then, any unexpected result fails closed at check 5.
+
+### 5.12 Configuration Re-Apply (Midnight, Recovery, Reconnect)
+
+The macro's midnight check does not only verify settings; it re-applies them. `reconcileAutocancellationReadiness()` calls `ensureRequiredAutocancellationConfigurations()`, which writes `RoomAnalytics.PeoplePresenceDetector=On`, `PeoplePresence.Input.HeadDetector=On`, `PeopleCountOutOfCall=On`, `PeoplePresence.Input.Ultrasound` (per setting, `Off` by default), `RoomInUse.InCall=Enabled`, `RoomInUse.LocalUsage=Enabled`, and `Bookings.CheckIn.WindowDuration=60`; dry run also enforces `Bookings.CheckIn.Enabled=False`. It then re-verifies.
+
+The service does the same at actor start, at the midnight health check, at every bounded readiness recovery attempt (§5.3), after an ingress reconnect (§7.2), and after the instance lease is re-acquired (§8.5). The mode's configuration writes run first, batched with `xapi.config.setMany` where possible and serialized per device (§5.4); full revalidation follows.
+
+| Mode | Writes |
+| :--- | :--- |
+| `LIVE` | Presence baseline and CheckIn window, then re-run the §5.6 native CheckIn policy for the current status (never a blind `Enabled` write). |
+| `DRY_RUN` | Presence baseline and CheckIn window, then `Bookings.CheckIn.Enabled=False` when it is enabled (§5.6). |
+| `MONITOR_ONLY`, `DISABLED` | None. |
+
+- **Fleet gates.** While the kill switch or tripwire is active, the presence and window writes still run, because they never change a booking. Native CheckIn writes are forbidden (§5.8).
+- **Jitter.** Each room's midnight check runs at codec-local midnight plus a per-room random delay spread over a bounded window (`MIDNIGHT_HEALTH_CHECK_JITTER_MAX_MS`, up to 15 minutes), so ~800 rooms do not hit Webex rate limits at once. `429` responses are handled as in §9.
+- **Failure.** A failed write or verification keeps or sets the matching transient block (`RequiredConfigurationsUnavailable`, `NativeCheckInSettingUnavailable`), cancels any workflow, preserves the booking, and hands over to readiness recovery (§5.3).
+
+### 5.13 Device Reboot Detection
+
+Device configuration persists across a reboot, so a reboot does not undo the §5.12 writes. The hazard is a service workflow that outlives a reboot which wiped its prompt: the room would reach the deadline without the occupants having seen a warning. On the device, the macro restarts with the codec and quarantines the in-progress meeting; the service reproduces that outcome.
+
+- **Reads.** `getUptimeSeconds()` (`SystemUnit.Uptime`, a status read) when a countdown starts (stored as `deviceUptimeBaselineSeconds`, with `workflowStartedAt`), on each 60 s chime tick, and as JIT check 11. If the read fails when a countdown would start, no countdown starts and the booking is preserved. A failed read on a chime tick is logged; check 11 still requires a successful read.
+- **Detection.** A reboot is detected when the uptime is lower than the baseline or less than the workflow's age (`now - workflowStartedAt`).
+- **Effect.** Abort with `device_rebooted_during_workflow`: invalidate and cancel the workflow, clear prompts, preserve the booking. Restart the actor with startup semantics: an in-progress meeting is quarantined until it ends (`Enabled=False` in `LIVE`, §5.9), followed by the full reconciliation of §5.12.
+- **`BootEvent`.** The subscribable `BootEvent` (`Action`: `Restart`, `Shutdown`, `Upgrade`) fires before the restart, and RoomOS has no "booted" event (§9). It is only an early trigger: the actor cancels any workflow, clears prompts on a best-effort basis, and sets `deviceReconcilePending`. The next event or read for the device runs the uptime check and full reconciliation, restarting with startup semantics if the uptime shows a restart. It is never the safety gate; a missed `BootEvent` is caught by the uptime reads.
+- **Pending device test.** DT4 (`SystemUnit.Uptime` across a reboot and `BootEvent` timing) confirms these assumptions.
+
+### 5.14 Intentional Differences from the Macro
+
+Each difference below either adds a reason to preserve a booking or is a documented platform gap. Everything else matches the macro.
+
+| Scenario | Macro outcome | Service outcome | Why acceptable |
+| :--- | :--- | :--- | :--- |
+| Automatic CheckIn returns "already checked in" | Logged; a later vacancy still starts No-Show (macro TEST 34A). | CheckIn confirmed; no No-Show for this lifecycle (Early Departure if enabled). | Preserve-side. RoomOS has stated the meeting is checked in; the service cannot receive `CheckedIn` to learn it any other way. |
+| Ad hoc booking (`BookedFromDevice`) with long-meeting threshold `0` | `Bookings.Get` is skipped, so the flag is unknown; the CheckIn is learned from the native `CheckedIn` event. | Flag always read; CheckIn confirmed; no automatic CheckIn, no No-Show. | Preserve-side. RoomOS checks ad hoc bookings in on creation, and the service cannot receive `CheckedIn`. |
+| Booking already active when the actor starts (service start, promotion, or after a detected reboot) | Quarantined until a matching `CheckedIn` event or the meeting ends. | Quarantined until the meeting ends or the booking ID changes. | Preserve-side. `CheckedIn` is not delivered to Workspace Integrations. |
+| Controller connects mid-prompt in a room that had none at display | Prompt displayed and owned; release may proceed. | Prompt not given; booking kept at expiry. | Preserve-side. Ownership must be proven by reads around the display, not inferred later. |
+| Controller-ID set changes while a prompt is visible | Prompt follows the controller; release may proceed. | Prompt re-displayed for the remaining time; automatic release blocked. | Preserve-side. Without topology events the service cannot prove the new controller showed the prompt for the whole warning. |
+| Manual panel check-in, then the room stays empty for the whole timeout (only if DT1 is negative) | No countdown; booking kept. | Countdown, prompt, and warning email; released if nobody answers. | Not preserve-side: the one accepted platform gap (§5.9). Occupants and the organizer are warned, and the email says what to do if they already checked in. Closed if DT1 shows the state is readable. |
 
 ---
 
@@ -803,11 +898,13 @@ The impending release clock time is `promptExpiresAt`, formatted using the room 
 - **HTML Body**: Clean, responsive layout detailing:
   - Meeting Title and Room Name.
   - Notice that the room is detected as vacant.
-  - Statement: *"This reservation will be automatically released in **${warningMinutes} minutes** (at **${scheduledReleaseLocalTime}**) unless physical occupancy is detected or confirmed on the room controller."*
+  - Statement: *"If this meeting has not been checked in, this reservation will be automatically released in **${warningMinutes} minutes** (at **${scheduledReleaseLocalTime}**) unless physical occupancy is detected or confirmed on the room controller."*
   - Bulleted instructions:
     - If you are using the room: Occupy the space or tap **Keep Booking** on the touch screen.
+    - If you already checked in: Tap **Keep Booking** in the room to keep the reservation.
     - If you no longer need the room: Tap **Check Out** on the touch controller or do nothing to allow automatic release.
 - **Plain-Text Alternative**: Exact text synchronization for plain-text email clients.
+- **Wording note (pending DT1):** the conditional "If this meeting has not been checked in" sentence and the "already checked in" bullet cover the residual gap in §5.9. The bullet deliberately does not say "no action is needed": in the gap case, a panel check-in alone does not stop the release. If device test DT1 shows the CheckIn state is readable, a checked-in meeting never reaches a warning, and both may be removed.
 
 #### Cancellation Notice Email (Dispatched Post-Release)
 
@@ -834,12 +931,12 @@ The roster gate is a single in-memory lookup, refreshed whenever the roster chan
 - **Ingress:** every notification from the long-poll transport is matched by `deviceId` before dispatch. The event is **discarded** when there is no roster entry, the entry is `DISABLED`, `inventoryStatus` is not `Present`, or the event's `deviceId` differs from the entry's managed `deviceId`. Discards are counted per reason (`events_discarded_total{reason}`) and are never logged per event, so a large unenrolled estate cannot flood the logs.
 - **Commands and configuration writes:** the Webex adapter rejects any xCommand or xConfig write to a device that the gate does not currently allow. It also rejects every write to a `MONITOR_ONLY` device, except the one-time clean-up writes of a mode transition (§5.7). This is defence in depth: a coordinator bug cannot touch a room that was never enrolled.
 - **Before the store loads:** the gate allows nothing until the roster has been loaded successfully (§8.5).
-- **Fleet gates:** while the kill switch or tripwire is active (§5.8), the adapter also rejects `Bookings.CheckIn` and `Bookings.CheckOut` for every device, as a second line behind the coordinator.
+- **Fleet gates:** while the kill switch or tripwire is active (§5.8), the adapter also rejects `Bookings.CheckIn`, `Bookings.CheckOut`, and `Bookings.CheckIn.Enabled` writes for every device, as a second line behind the coordinator. Presence baseline and CheckIn window writes are still allowed (§5.12).
 
 ### 7.2 Actor Creation and Ingress Connectivity
 
-- **Actor start sequence** (per room; mirrors macro spec §6): apply the mode's configuration writes (`DRY_RUN`/`LIVE` only), refresh the prompt surfaces, read presence, then read availability and the booking snapshot as one versioned snapshot. If a booking is active, quarantine it (§5.9). Then read codec time and schedule the codec-local midnight check. An event that arrives during these reads wins over the slower read: the snapshot is discarded and re-read (§5.1).
-- **Long-poll connectivity:** the macro is always subscribed; the service can miss events while the long poll is failing. When `IEventIngressTransport` reports a reconnection after an outage (`onConnectivityChange`), every actor runs a full revalidation (the readiness reconciliation of §5.3) before any new countdown may start. Active countdowns and prompts are cancelled during the outage only if their JIT validation fails at expiry; the JIT probe already re-reads every input.
+- **Actor start sequence** (per room; mirrors macro spec §6): apply the mode's configuration writes (`DRY_RUN`/`LIVE` only, §5.12), read presence, then read availability and the booking snapshot as one versioned snapshot. If a booking is active, quarantine it (§5.9). Then read codec time and schedule the codec-local midnight check. An event that arrives during these reads wins over the slower read: the snapshot is discarded and re-read (§5.1).
+- **Long-poll connectivity:** the macro is always subscribed; the service can miss events while the long poll is failing. When `IEventIngressTransport` reports a reconnection after an outage (`onConnectivityChange`), every actor re-applies its mode's configuration writes and runs a full revalidation (§5.12, then the readiness reconciliation of §5.3) before any new countdown may start. Active countdowns and prompts are cancelled during the outage only if their JIT validation fails at expiry; the JIT validation already re-reads every input, including uptime (§5.13).
 - **Periodic full sync:** Webex also delivers periodic full-state status notifications (roughly hourly). They are processed like any other status event and are not a substitute for revalidation.
 
 ```typescript
@@ -914,7 +1011,7 @@ The inventory sync runs at startup and with the Tier 2 sweeper (every 15 minutes
 
 `RoomScheduler` Navigators and peripherals are never booking-capable and are never roster candidates.
 
-`listDevices()` returns every device in the org, even when the integration is activated only for selected locations: location-limited activation restricts xCommand and xStatus calls (`403 Forbidden` outside the permitted locations), but not the device list or configuration writes. Devices outside the activated locations therefore also become `DISABLED` entries. An enrollment attempt for such a device fails its readiness probe (status reads return `403`) and is refused. Because configuration writes are not location-limited, the outbound command gate (§7.1) must cover configuration writes as well as commands.
+`listDevices()` returns every device in the org, even when the integration is activated only for selected locations: location-limited activation restricts xCommand and xStatus calls (`403 Forbidden` outside the permitted locations), but not the device list or configuration writes. Devices outside the activated locations therefore also become `DISABLED` entries. An enrollment attempt for such a device fails its readiness reads (status reads return `403`) and is refused. Because configuration writes are not location-limited, the outbound command gate (§7.1) must cover configuration writes as well as commands.
 
 ### 8.4 Concurrency and Writes
 
@@ -930,13 +1027,14 @@ The inventory sync runs at startup and with the Tier 2 sweeper (every 15 minutes
 - **Tripwire:** when it trips, it writes `tripwireTrippedAt`. It stays tripped across restarts until an admin resets it.
 - **Single active instance:** before opening the roster gate, the service acquires the `INSTANCE_LEASE` item with a conditional write (a holder ID and an expiry roughly 30s ahead, renewed every 10s). This prevents two instances (for example, an ECS rolling deployment overlap) from driving the same rooms. The ECS service must also deploy with `minimumHealthyPercent = 0` and `maximumPercent = 100`.
   - **Holder ID:** a stable host identity (the EC2 instance ID under `systemd`), so a quick process restart on the same host re-acquires its own lease immediately. A replacement ECS task has a new identity and waits for the old lease to expire (at most about 30 s) before it manages rooms.
-  - **Lease loss:** if the lease cannot be renewed before it expires (another holder took it, or the store is unreachable), the instance immediately stops every device command and configuration write and stops starting workflows. It does not try to clear prompts, because it can no longer prove it owns the rooms; any visible prompt simply expires on the device. Actors keep tracking state. When the lease is re-acquired, every actor runs a full revalidation (§7.2) before automation resumes. A store outage longer than the lease therefore halts automation fleet-wide, which is the fail-closed outcome.
+  - **Lease loss:** if the lease cannot be renewed before it expires (another holder took it, or the store is unreachable), the instance immediately stops every device command and configuration write and stops starting workflows. It does not try to clear prompts, because it can no longer prove it owns the rooms; any visible prompt simply expires on the device. Actors keep tracking state. When the lease is re-acquired, every actor re-applies its mode's configuration writes and runs a full revalidation (§5.12, §7.2) before automation resumes. A store outage longer than the lease therefore halts automation fleet-wide, which is the fail-closed outcome.
 
 ### 8.6 Promotion Readiness Report
 
 Before the `DRY_RUN → LIVE` promotion is confirmed, the dashboard shows a per-room readiness report. Promotion requires an explicit admin confirmation, which is recorded in the audit log together with the report. There is no minimum dry-run duration; that is the administrator's judgement. The report covers:
 
-- An actionable surface is available: a connected `TouchPanel` with `Role = Controller`, or a Desk Pro.
+- A controller is present: a fresh `Peripherals.ConnectedDevice` read finds at least one connected `TouchPanel` with `Role = Controller` (`RoomScheduler` Navigators do not count), or the device is a Desk Pro with an interactive OSD. Without one, every automatic release in `LIVE` fails JIT check 5 (§5.11).
+- `SystemUnit.Uptime` is readable (JIT check 11 requires it, §5.13).
 - Presence telemetry has been observed reporting both `Occupied` and `Empty`.
 - The device reports a valid codec timezone (`Time.SystemTime` with an offset).
 - The required configuration writes have succeeded.
@@ -957,11 +1055,16 @@ These constraints come from the official SDK ([cisco-ce/workspace-integrations-n
 | Constraint | Consequence for the service |
 | :--- | :--- |
 | `Bookings.CheckedIn` is not a supported event subscription | No CheckIn event is ever received. CheckIn confirmation uses the signals in §5.9; startup quarantine lasts until the meeting ends. |
-| `Peripherals.ConnectedDevice` topology (`Type`, `Status`, `Role`) is not subscribable; only sensor values are | Controller availability is read on demand (§5.11). |
-| Subscribable and needed: `RoomAnalytics.RoomInUse`, `Bookings.Availability.*`, events `UserInterface.Message.Prompt.Response` and `.Cleared` | These drive the room actor. `Bookings.Current.Id`, `SystemUnit.ProductPlatform`, and `Time.SystemTime` are read with `status.get` only. |
+| Whether `Bookings.Get`, `Bookings.List`, or an xStatus exposes a booking's CheckIn state is unverified (device test DT1) | If it does, the service reads it before a No-Show countdown and at JIT check 12; if not, the residual gap in §5.9 applies. |
+| RoomOS checks a booking in natively when the people count is at least 1, sustained for about 1 minute, from about 4 minutes after the start; when a call is joined; when content is shared; for an ad hoc booking (`BookedFromDevice`); and as configured by `AutoCheckInDuration` | The service learns of a native check-in only through its own automatic CheckIn returning "already checked in", or through `BookedFromDevice` (§5.9). |
+| With `Bookings.CheckIn.Enabled = False`, check-in is unavailable on the device | Quarantined and blocked bookings in `LIVE` keep `Enabled = False` (§5.6), so nobody can check them in and native no-show release cannot run. |
+| `Peripherals.ConnectedDevice` topology (`Type`, `Status`, `Role`) is not subscribable; only sensor values are | Controller availability is read just in time at fixed workflow points; no listener and no polling timer (§5.11). |
+| Subscribable and needed: `RoomAnalytics.RoomInUse`, `Bookings.Availability.*`, events `UserInterface.Message.Prompt.Response` and `.Cleared`, and `BootEvent` | These drive the room actor. `Bookings.Current.Id`, `SystemUnit.ProductPlatform`, `SystemUnit.Uptime`, and `Time.SystemTime` are read with `status.get` only. |
+| `BootEvent` (`Action`: `Restart`, `Shutdown`, `Upgrade`) fires before the restart; there is no "booted" event | `BootEvent` is only an early trigger to cancel a workflow. Reboots are detected from `SystemUnit.Uptime` (§5.13; timing pending device test DT4). |
+| Device configuration persists across a reboot | A reboot does not undo the §5.12 writes; the reboot hazard is a workflow outliving a wiped prompt (§5.13). |
 | Optional informational events: `Bookings.Start`, `Bookings.End`, `Bookings.Deleted` (`Cause` such as `NoShow`, `ManualCheckOut`) | May enrich `[EXTERNAL_RELEASE_OBSERVED]` logs (for example, attributing a native no-show). Never used for safety decisions. |
 | Long polling starts automatically inside `connect({ notifications: 'longpolling' })`; the SDK has no stop method and retries poll errors every 5 s | Do not call the internal `pollData()`. Shutdown closes the roster gate and exits the process. Poll errors are surfaced through `onConnectivityChange` (§7.2). |
-| The SDK does not retry HTTP `429`; it throws with `retryAfter` | The adapter queues commands per device and honors `Retry-After` with jittered backoff. A command that cannot be sent before its workflow deadline fails closed (for example, no CheckOut). |
+| The SDK does not retry HTTP `429`; it throws with `retryAfter` | The adapter queues commands per device and honors `Retry-After` with jittered backoff. A command that cannot be sent before its workflow deadline fails closed (for example, no CheckOut). `Bookings.CheckIn` and `Bookings.CheckOut` are never retried after a timeout or any error, except a `429` received before dispatch, because the device may already have executed them. |
 | Location-limited activation returns `403` for commands and status outside the permitted locations, but the device list and configuration writes stay org-wide | Discovery sees the whole org (§8.3). The command gate (§7.1) covers configuration writes. |
 | Configurations are not declared in the manifest; reading and writing them requires `spark-admin:devices_read` and `spark-admin:devices_write` | Use `xapi.config.get/set/setMany(deviceId, …)`. |
 | `UserInterface.Message.Prompt.Response.OptionId` is an integer in the xAPI schema; the event also carries `Origin` | The adapter normalizes `OptionId` with `String()` and maps `Origin` to `PromptResponseEvent.origin`. |

@@ -5329,6 +5329,53 @@ async function executeTests() {
         console.log('✓ Test 73 Passed.');
     }
 
+    // --------------------------------------------------------------------------------
+    // TEST 74: Midnight health check re-applies the required configurations
+    // --------------------------------------------------------------------------------
+    {
+        console.log('▶ Test 74: Midnight health check re-applies the required configurations...');
+        const s = createFreshSandbox();
+        loadMacroWithTestConfig(s);
+        s.xapi.Status.RoomAnalytics.RoomInUse._current = 'False';
+        await s.init();
+
+        const reappliedSettings = [
+            ['RoomAnalytics.PeoplePresenceDetector', s.xapi.Config.RoomAnalytics.PeoplePresenceDetector],
+            ['RoomAnalytics.PeoplePresence.Input.HeadDetector', s.xapi.Config.RoomAnalytics.PeoplePresence.Input.HeadDetector],
+            ['RoomAnalytics.PeoplePresence.Input.Ultrasound', s.xapi.Config.RoomAnalytics.PeoplePresence.Input.Ultrasound],
+            ['RoomAnalytics.PeopleCountOutOfCall', s.xapi.Config.RoomAnalytics.PeopleCountOutOfCall],
+            ['RoomAnalytics.RoomInUse.InCall', s.xapi.Config.RoomAnalytics.RoomInUse.InCall],
+            ['RoomAnalytics.RoomInUse.LocalUsage', s.xapi.Config.RoomAnalytics.RoomInUse.LocalUsage],
+            ['Bookings.CheckIn.WindowDuration', s.xapi.Config.Bookings.CheckIn.WindowDuration]
+        ];
+        const setCallsBeforeMidnight = reappliedSettings.map(([, setting]) => setting._setCalls);
+        const checkInEnabledSetCallsBeforeMidnight = s.xapi.Config.Bookings.CheckIn.Enabled._setCalls;
+        reappliedSettings.forEach(([name], index) => {
+            assert.strictEqual(setCallsBeforeMidnight[index], 1,
+                `Startup must write ${name} exactly once before the midnight health check.`);
+        });
+
+        const midnightTimer = Object.values(activeTimeouts).find(timer =>
+            timer.callback.toString().includes('reconcileAutocancellationReadiness'));
+        assert.ok(midnightTimer, 'A midnight health check should be active before it fires.');
+        delete activeTimeouts[midnightTimer.id];
+        await midnightTimer.callback();
+
+        reappliedSettings.forEach(([name, setting], index) => {
+            assert.strictEqual(setting._setCalls, setCallsBeforeMidnight[index] + 1,
+                `The midnight health check must re-apply ${name}.`);
+        });
+        assert.strictEqual(s.xapi.Config.Bookings.CheckIn.WindowDuration._latest, '60',
+            'The midnight health check must re-apply the native CheckIn window duration value.');
+        assert.strictEqual(s.xapi.Config.RoomAnalytics.PeoplePresence.Input.Ultrasound._latest, 'Off',
+            'The midnight health check must re-apply the default ultrasound setting.');
+        assert.strictEqual(s.xapi.Config.Bookings.CheckIn.Enabled._setCalls, checkInEnabledSetCallsBeforeMidnight,
+            'Dry-run midnight health check must not rewrite an already-disabled native CheckIn configuration.');
+        assert.strictEqual(vm.runInContext('bookingLifecycle.autocancellation.areRequiredConfigurationsHealthy', s), true,
+            'Successful midnight re-application must leave the required configurations healthy.');
+        console.log('✓ Test 74 Passed.');
+    }
+
     console.log('\n======================================================');
     console.log('🚀 SUCCESS: All BookingAutoCancellation unit tests passed!');
     console.log('======================================================');
