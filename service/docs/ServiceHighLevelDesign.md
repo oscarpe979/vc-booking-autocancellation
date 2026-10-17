@@ -17,7 +17,7 @@ The validated macro and its [specification](../../codec-native/docs/BookingAutoC
 - **Hardware Agnosticism**: Standardized Hardware Abstraction Layer (HAL) allowing future replacement or augmentation of codecs with alternative hardware vendors (e.g., Poly, Neat, Logitech) or third-party occupancy sensors.
 - **Runtime Environment**:
   - **Local Development**: Node.js / TypeScript running locally on engineer workstations via outbound long-polling (zero inbound firewall pinholes, zero ngrok/tunneling required) with mock email logging.
-  - **Production Target (AWS)**: Modular infrastructure provisioned via Terraform, designed to run with maximum operational simplicity in private VPC subnets with outbound connectivity to Webex (HTTPS 443) and corporate SMTP (`outlook.suncorp.com.au:25`). Supports either a containerized task (AWS ECS Fargate) or a hardened single-instance VM (AWS EC2 RHEL 9 with `systemd` supervisor under a Min=1, Max=1 Auto Scaling Group).
+  - **Production Target (AWS)**: Modular infrastructure provisioned via Terraform, designed to run with maximum operational simplicity in private VPC subnets with outbound connectivity to Webex (HTTPS 443) and corporate SMTP (`outlook.suncorp.com.au:25`). Runs as one `systemd`-supervised Node.js process on a single AWS EC2 RHEL 9 instance in a Min=1, Max=1 Auto Scaling Group across two Availability Zones (§8.2, ADR-002).
 
 ---
 
@@ -193,7 +193,7 @@ Abstracts end-user email communications:
 
 - `sendCancellationWarning(payload: CancellationWarningPayload): Promise<NotificationResult>`: Dispatches an urgent warning email to the meeting organizer when the in-room countdown prompt is triggered.
   - **Dynamic Time Calculation**: Never hardcodes minutes; states the real time remaining to the fixed warning deadline (`promptExpiresAt`, which includes the grace period in `LIVE`) and formats the impending release time in the codec's local clock timezone (LLD §6.1).
-  - **Conditional Wording**: The release statement applies only "if this meeting has not been checked in", and the email tells an organizer who already checked in to tap **Keep Booking** in the room. This covers the case where the service cannot see a manual panel check-in (pending device test DT1, LLD §5.9, §6.2).
+  - **Informational Only**: The email states that the room was detected as empty, when the reservation will be released, and that it is not released if someone is in the room at that time or if the booking is kept using the touch controller in the room before then. The email is informational only: it has no links or buttons and asks for no action in the email itself. It makes no claim about CheckIn, so it stays true in the residual gap where the service cannot see a manual panel check-in (pending device test DT1, LLD §5.9, §6.2).
   - **One Email per Deadline**: One warning email is sent per warning deadline. A new deadline (a fresh countdown after Keep Booking, or the unconfirmed-guard restore) sends a new email; re-displaying a dismissed prompt (`restoreDismissedPrompt`) keeps the deadline and never re-sends.
   - **Delivery Verification & Fail-Closed Gate** (when `NOTIFICATIONS_ENABLED = true`): If SMTP dispatch fails after bounded immediate retries, or the organizer email is missing, the service sets `warningEmailFailed` for the rest of the booking lifecycle. The prompt stays visible so occupants can still act, but automatic release is **blocked** at the deadline and no further countdown starts in that lifecycle (LLD §5.8).
 - `sendCancellationNotice(payload: CancellationNoticePayload): Promise<NotificationResult>`: Dispatches a conclusive cancellation notice to the meeting organizer immediately following a successful automatic `checkOut()`. A user-confirmed CheckOut from the room controller sends no notice.
@@ -328,7 +328,7 @@ Like the macro's midnight check (`reconcileAutocancellationReadiness()`), the he
 - **Stale or unmatched prompt responses** are logged and ignored.
 - **Controller topology** cannot be subscribed to, so the service reads it just in time instead of reacting to change events as the macro does (LLD §5.11). A Navigator controller is assumed and the prompt is always sent to it. Ownership needs a controller on the reads just before and just after the display. On each 60s chime tick the service re-reads the topology: a changed controller set or a failed read drops ownership, and a present controller is re-shown the prompt for the remaining time only; the deadline never moves. At the deadline, release is blocked unless the read succeeds and shows exactly the controller set captured at display. A matching `Prompt.Response` proves user intent but never authorizes an automatic release. There is no listener and no separate polling timer.
 - **Automatic CheckIn** is attempted at most once per lifecycle, carries `TrackingData: BookingAutoCancellation_Automatic`, and revalidates booking, end time, and occupancy before sending. It is suppressed when CheckIn is already confirmed. Confirmation comes only from the service's own successful CheckIn, an "already checked in" response (logged as informational; this is how the service learns of a RoomOS native check-in), `BookedFromDevice`, or, pending device test DT1, a read CheckIn state (LLD §5.9). A failed automatic CheckIn never blocks a later No-Show release.
-- **Manual panel check-in in an empty room** (only if DT1 shows the CheckIn state is not readable): the service cannot see it, so it runs the countdown, prompt, and warning email, and releases if nobody answers. This is the one accepted case where the service can release a booking the macro would keep; the in-room prompt and the conditional email wording mitigate it (LLD §5.9, §5.14).
+- **Manual panel check-in in an empty room** (only if DT1 shows the CheckIn state is not readable): the service cannot see it, so it runs the countdown, prompt, and warning email, and releases if nobody answers. This is the one accepted case where the service can release a booking the macro would keep; the in-room prompt and the warning email mitigate it (LLD §5.9, §5.14).
 - **Device reboot during a workflow** is detected from `SystemUnit.Uptime`, read when a countdown starts, on each chime tick, and at JIT validation. An uptime lower than the baseline or less than the workflow's age aborts with `device_rebooted_during_workflow`: the workflow is cancelled, prompts are cleared, the booking is preserved, and the actor restarts with startup semantics (in-progress meeting quarantined until it ends) and a full configuration re-apply. `BootEvent` fires before a restart and is used only as an early trigger, never as the safety gate (LLD §5.13).
 - **CheckOut failure** records `Blocked / CheckOutFailed` for the rest of the lifecycle. The service never falls back to `Delete`.
 - **Kill switch and tripwire** (service-only) stop all automation: active workflows are cancelled and prompts cleared, and no countdown, prompt, warning email, automatic CheckIn, or CheckOut (including a user-confirmed Check Out) is started (§7.3).
@@ -417,7 +417,8 @@ The service embeds a lightweight, server-rendered administration and configurati
   - Successful logins get an HTTP-only, `SameSite=Strict` session cookie, and every state-changing request requires a CSRF token.
   - If no password is configured, the dashboard refuses to start rather than running open.
   - Because the identity is shared, audit records use the actor `admin`.
-  - Per-user identity (corporate SSO), role separation (for example, who may promote to `LIVE`), and the remote access path in AWS are deferred to a later phase.
+  - In AWS, admins reach the dashboard through SSM Session Manager port forwarding to the instance (§8.2); there is no inbound path.
+  - Per-user identity (corporate SSO) and role separation (for example, who may promote to `LIVE`) are deferred to a later phase.
 
 ---
 
@@ -431,30 +432,45 @@ The service embeds a lightweight, server-rendered administration and configurati
 - `MockNotificationDriver` captures warning and cancellation emails, formatting rich previews to the terminal console and recording them in memory for test verification.
 - `JsonFileFleetConfigStore` persists the roster, settings, and audit log to a gitignored file under `service/.local/`, so local runs need no database. A fresh file manages no rooms until an engineer enrolls a test room.
 
-### 8.2 Production Infrastructure on AWS (Terraform-Provisioned)
+### 8.2 Production Compute on AWS: EC2 RHEL 9 + systemd (Terraform-Provisioned)
 
-To keep cloud operations as simple, maintainable, and reliable as possible, the AWS infrastructure is fully codified via Terraform. The architecture is intentionally compute-agnostic, supporting either a containerized service or a dedicated VM depending on organizational hosting standards:
+The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 instance, and all AWS infrastructure is codified in Terraform. This is a single instance with automated recovery, not high availability. That is acceptable because every outage fails closed: no booking is released while the service is down, and native RoomOS behaviour continues. ECS Fargate was evaluated and is the documented fallback if Suncorp platform standards require containers ([ADR-002](adr/ADR-002-compute-ec2-rhel.md)).
 
-- **Compute Option A (Containerized - AWS ECS Fargate)**:
-  - Runs as a single active task (Min=1, Max=1) managed by an ECS Service, deployed with `minimumHealthyPercent = 0` and `maximumPercent = 100` so two tasks never overlap (the DynamoDB lease is the second guard).
-  - Zero OS maintenance, zero AMI patching, instant container startup.
-  - Automatically restarts failed tasks within seconds. A replacement task has a new lease holder identity, so it may wait up to about 30s for the old lease to expire before it manages rooms (LLD §8.5).
-- **Compute Option B (Virtual Machine - AWS EC2 RHEL 9)**:
-  - Single instance (`t4g.small` or `t3.small`) managed by an Auto Scaling Group (Min=1, Max=1, Desired=1) across two Availability Zones.
-  - Process supervised natively by Linux `systemd` (`booking-autocancel.service`) with `Restart=always`.
+- **Instance**:
+  - One RHEL 9 instance (`t3.medium`, x86_64, provisional until a load test with 800 actors and the security agents confirms the size) in an Auto Scaling Group with Min=1, Max=1, Desired=1, across two private subnets in different Availability Zones.
+  - Built from the Suncorp standard RHEL 9 image, or a hardened RHEL 9 image from EC2 Image Builder, with the SSM Agent (not included in AWS RHEL images, so installed explicitly), CloudWatch agent, and corporate security agents. SELinux stays enforcing; the deploy runbook restores file labels on each release.
+  - IMDSv2 only, no key pair, no public IP, encrypted root volume.
+  - RHEL licensing is either AWS pay-as-you-go RHEL images or Suncorp's existing subscriptions through Red Hat Cloud Access (to be confirmed with Suncorp Cloud Platform).
+- **Process**:
+  - `booking-autocancel.service` runs as a dedicated non-login user with `Restart=always`, a systemd watchdog so a hung event loop is restarted (pinged from an event-loop timer through a small notify helper, ADR-002), and systemd sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`).
+  - A crashed process is back within seconds and re-acquires its own lease immediately, because the lease holder ID is the instance ID (LLD §8.5).
+- **Release artifact**:
+  - CI builds a versioned, checksummed tarball containing the compiled service, production `node_modules`, and a pinned Node.js LTS runtime, and stores it in a versioned S3 bucket. Bundling Node means OS patching never changes the runtime.
+  - The image contains no application code. At boot the instance installs the approved release version recorded in SSM Parameter Store.
+- **Deploy and rollback**:
+  - An SSM Automation runbook installs a release in place: verify the checksum, run preflight checks, switch the `current` symlink, restart the unit, and wait for the local health check. On failure it switches back automatically.
+  - An in-place deploy keeps the instance, so the lease is re-acquired immediately. Previous releases stay on disk for rollback.
+- **Patching**:
+  - Monthly image rebuild, rolled out by Auto Scaling Group instance refresh with `MinHealthyPercentage = 0`, so two instances never overlap.
+  - Urgent security updates are installed in place by SSM Patch Manager (`dnf`), rebooting only when required.
+  - On shutdown the service releases its lease, so a replacement does not wait for it to expire.
+- **Restart window**: every restart quarantines the meetings in progress (§2), so planned deploys, patches, and instance refreshes run between 01:00 and 05:00 Sydney time.
+- **Recovery**: a process crash recovers within seconds on the same instance. A host or Availability Zone failure is recovered by the Auto Scaling Group launching a replacement in the other zone, which takes minutes; automation is halted (fail closed) until it is running.
+- **Admin access**: there is no inbound path and no SSH. Admins reach the `127.0.0.1`-bound dashboard through SSM Session Manager port forwarding, authorized by their AWS IAM Identity Center role. CloudTrail records who opened the tunnel but not what happens inside it, so dashboard actions rely on the application audit log (§7.4).
 - **Common Network & Security Architecture**:
   - **VPC Subnets**: Deployed strictly inside private subnets (zero public IP, zero inbound security group rules).
   - **Outbound Egress**:
     - Outbound HTTPS (TCP 443) to Webex Cloud APIs for long-polling telemetry and Control Hub inventory.
-    - DynamoDB through the VPC gateway endpoint (no internet path).
+    - Outbound HTTPS to the RHEL package repositories (Red Hat Update Infrastructure, or an internal Satellite) for patching and image builds, through the central egress. The path depends on the RHEL licensing choice.
+    - DynamoDB and S3 (release artifacts) through VPC gateway endpoints, and SSM and CloudWatch through interface endpoints or the landing zone's shared endpoints (no internet path).
     - Outbound SMTP (TCP 25) routed across the enterprise network / Direct Connect / Transit Gateway to `outlook.suncorp.com.au`.
   - **Zero Plaintext Secrets**: Webex credentials and secrets injected from AWS SSM Parameter Store (`SecureString`) at startup via IAM role / instance profile.
-  - **Observability**: CloudWatch Logs integration with structured JSON audit streams, CloudWatch Metric Filters for cancellation counts, and alarms on tripwire triggers.
+  - **Observability**: the CloudWatch agent forwards the service's structured JSON logs from journald to CloudWatch Logs, with metric filters for cancellation counts and alarms on tripwire triggers and a missing heartbeat.
 
 ### 8.3 Fleet Configuration Store (DynamoDB)
 
 - Three on-demand tables: rooms (roster), settings (global settings and the single-instance lease), and an append-only audit table. All have point-in-time recovery, deletion protection, and encryption at rest, and are provisioned by Terraform.
 - The tables are reached from the private subnets through a **DynamoDB VPC gateway endpoint**, so no internet egress is needed. The service IAM role is scoped to these three tables, and has no update or delete permission on the audit table.
 - Room runtime state stays in memory; only admin-controlled state is durable. If the store is unreachable at startup, the service manages nothing until it loads.
-- A DynamoDB lease item ensures only one service instance drives rooms at a time (for example, during an ECS deployment overlap). The holder ID is a stable host identity, so a process restart on the same host re-acquires its lease immediately; losing the lease stops every device command.
+- A DynamoDB lease item ensures only one service instance drives rooms at a time (for example, if a replacement instance starts while the old one is still running). The holder ID is a stable host identity, so a process restart on the same host re-acquires its lease immediately; losing the lease stops every device command.
 - Details: [ServiceLowLevelDesign.md §8](ServiceLowLevelDesign.md).

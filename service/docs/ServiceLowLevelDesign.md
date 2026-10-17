@@ -810,7 +810,7 @@ The macro learns about CheckIns from `xapi.Event.Bookings.CheckedIn`. **That eve
 - **CheckIn state read (pending DT1).** If device test DT1 shows that `Bookings.Get`, `Bookings.List`, or an xStatus exposes a booking's CheckIn state, the service reads it at exactly two points:
   1. When an empty room would start a No-Show countdown. `CheckedIn` records confirmation: no countdown, prompt, or email, exactly like the macro (Early Departure applies if enabled). An unreadable state starts no countdown and preserves the booking.
   2. As JIT check 12 before a No-Show CheckOut (§5.5).
-- **Residual gap if DT1 is negative.** An empty room has no occupant, so the service's automatic CheckIn never runs (it needs `AUTOMATIC_CHECK_IN_DELAY_MS` of occupancy) and returns no `AlreadyCheckedIn` result. If someone checks in on a panel (for example, a scheduler Navigator outside the door) and the room then stays empty for the full timeout, the service cannot see that check-in: it runs the countdown, shows the prompt, sends the warning email, and releases the booking if nobody answers. The macro would start no countdown. This is the one accepted case where the service can release a booking the macro would keep. It is mitigated by the in-room prompt and by the conditional warning-email wording (§6.2). Every other check-in path is still covered by RoomOS native check-in and the service's own CheckIn result.
+- **Residual gap if DT1 is negative.** An empty room has no occupant, so the service's automatic CheckIn never runs (it needs `AUTOMATIC_CHECK_IN_DELAY_MS` of occupancy) and returns no `AlreadyCheckedIn` result. If someone checks in on a panel (for example, a scheduler Navigator outside the door) and the room then stays empty for the full timeout, the service cannot see that check-in: it runs the countdown, shows the prompt, sends the warning email, and releases the booking if nobody answers. The macro would start no countdown. This is the one accepted case where the service can release a booking the macro would keep. It is mitigated by the in-room prompt and by the warning email, which tells the organizer when the release will happen (§6.2). Every other check-in path is still covered by RoomOS native check-in and the service's own CheckIn result.
 - **Device tests.** DT1 (CheckIn state readable) decides between the read and the documented gap. DT2 (exact already-checked-in error over SSH and the cloud) fixes the adapter's classification. Both are part of the Sprint 1 ticket 05 spike.
 
 ### 5.10 Settings Validation
@@ -876,7 +876,7 @@ Each difference below either adds a reason to preserve a booking or is a documen
 | Booking already active when the actor starts (service start, promotion, or after a detected reboot) | Quarantined until a matching `CheckedIn` event or the meeting ends. | Quarantined until the meeting ends or the booking ID changes. | Preserve-side. `CheckedIn` is not delivered to Workspace Integrations. |
 | Controller connects mid-prompt in a room that had none at display | Prompt displayed and owned; release may proceed. | Prompt not given; booking kept at expiry. | Preserve-side. Ownership must be proven by reads around the display, not inferred later. |
 | Controller-ID set changes while a prompt is visible | Prompt follows the controller; release may proceed. | Prompt re-displayed for the remaining time; automatic release blocked. | Preserve-side. Without topology events the service cannot prove the new controller showed the prompt for the whole warning. |
-| Manual panel check-in, then the room stays empty for the whole timeout (only if DT1 is negative) | No countdown; booking kept. | Countdown, prompt, and warning email; released if nobody answers. | Not preserve-side: the one accepted platform gap (§5.9). Occupants and the organizer are warned, and the email says what to do if they already checked in. Closed if DT1 shows the state is readable. |
+| Manual panel check-in, then the room stays empty for the whole timeout (only if DT1 is negative) | No countdown; booking kept. | Countdown, prompt, and warning email; released if nobody answers. | Not preserve-side: the one accepted platform gap (§5.9). Occupants are warned by the in-room prompt and the organizer by the warning email. Closed if DT1 shows the state is readable. |
 
 ---
 
@@ -894,17 +894,13 @@ The impending release clock time is `promptExpiresAt`, formatted using the room 
 
 #### Cancellation Warning Email (Dispatched at Countdown Warning)
 
-- **Subject**: `[Action Required] Room Release Warning: ${roomName}`
+- **Subject**: `Room Release Notice: ${roomName}`
 - **HTML Body**: Clean, responsive layout detailing:
   - Meeting Title and Room Name.
-  - Notice that the room is detected as vacant.
-  - Statement: *"If this meeting has not been checked in, this reservation will be automatically released in **${warningMinutes} minutes** (at **${scheduledReleaseLocalTime}**) unless physical occupancy is detected or confirmed on the room controller."*
-  - Bulleted instructions:
-    - If you are using the room: Occupy the space or tap **Keep Booking** on the touch screen.
-    - If you already checked in: Tap **Keep Booking** in the room to keep the reservation.
-    - If you no longer need the room: Tap **Check Out** on the touch controller or do nothing to allow automatic release.
+  - Statement: *"${roomName} has been detected as empty. This reservation will be released automatically in **${warningMinutes} minutes** (at **${scheduledReleaseLocalTime}**) so that colleagues can use the room."*
+  - Statement: *"The reservation is not released if someone is in the room at that time, or if the booking is kept using the touch controller in the room before then. If you no longer need the room, it will be released at that time."*
 - **Plain-Text Alternative**: Exact text synchronization for plain-text email clients.
-- **Wording note (pending DT1):** the conditional "If this meeting has not been checked in" sentence and the "already checked in" bullet cover the residual gap in §5.9. The bullet deliberately does not say "no action is needed": in the gap case, a panel check-in alone does not stop the release. If device test DT1 shows the CheckIn state is readable, a checked-in meeting never reaches a warning, and both may be removed.
+- **Informational only.** The email is informational only: it has no links or buttons and asks for no action in the email itself. It makes no claim about CheckIn, so it stays true in the residual gap where the service cannot see a manual panel check-in (§5.9). If device test DT1 shows the CheckIn state is readable, a checked-in meeting never reaches a warning.
 
 #### Cancellation Notice Email (Dispatched Post-Release)
 
@@ -1025,8 +1021,8 @@ The inventory sync runs at startup and with the Tier 2 sweeper (every 15 minutes
 - **Runtime outage:** the service keeps operating on the last-known-good roster and settings already in memory. The dashboard rejects every write, with one exception: **activating** the kill switch applies in memory immediately, is shown as `active (not persisted)`, and is retried until it is persisted. **Deactivating** the kill switch requires a successful persist.
 - **Second kill-switch source:** the kill switch is active if *either* the store item *or* the `AUTOCANCEL_KILL_SWITCH` SSM/environment parameter is true. The service re-reads the SSM parameter every 30 seconds (`KILL_SWITCH_PARAMETER_POLL_MS`), so operators can halt the fleet within 30 seconds, without a restart, even when the store or the localhost-only dashboard is unavailable. An unreadable parameter keeps its last value; a parameter that has never been read since startup is treated as active.
 - **Tripwire:** when it trips, it writes `tripwireTrippedAt`. It stays tripped across restarts until an admin resets it.
-- **Single active instance:** before opening the roster gate, the service acquires the `INSTANCE_LEASE` item with a conditional write (a holder ID and an expiry roughly 30s ahead, renewed every 10s). This prevents two instances (for example, an ECS rolling deployment overlap) from driving the same rooms. The ECS service must also deploy with `minimumHealthyPercent = 0` and `maximumPercent = 100`.
-  - **Holder ID:** a stable host identity (the EC2 instance ID under `systemd`), so a quick process restart on the same host re-acquires its own lease immediately. A replacement ECS task has a new identity and waits for the old lease to expire (at most about 30 s) before it manages rooms.
+- **Single active instance:** before opening the roster gate, the service acquires the `INSTANCE_LEASE` item with a conditional write (a holder ID and an expiry roughly 30s ahead, renewed every 10s). This prevents two instances (for example, a replacement EC2 instance starting while the old one is still running) from driving the same rooms. The Auto Scaling Group's instance refresh also runs with `MinHealthyPercentage = 0`, so planned replacements never overlap.
+  - **Holder ID:** a stable host identity (the EC2 instance ID under `systemd`), so a quick process restart on the same host re-acquires its own lease immediately. A replacement instance has a new identity and waits for the old lease to expire (at most about 30 s) before it manages rooms, unless the old process released the lease on shutdown.
   - **Lease loss:** if the lease cannot be renewed before it expires (another holder took it, or the store is unreachable), the instance immediately stops every device command and configuration write and stops starting workflows. It does not try to clear prompts, because it can no longer prove it owns the rooms; any visible prompt simply expires on the device. Actors keep tracking state. When the lease is re-acquired, every actor re-applies its mode's configuration writes and runs a full revalidation (§5.12, §7.2) before automation resumes. A store outage longer than the lease therefore halts automation fleet-wide, which is the fail-closed outcome.
 
 ### 8.6 Promotion Readiness Report
