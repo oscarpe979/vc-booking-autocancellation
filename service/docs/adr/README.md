@@ -5,7 +5,7 @@ Each record captures one significant decision: its context, the alternatives con
 | ADR | Decision | Status |
 | :--- | :--- | :--- |
 | ADR-001 | Centralised service instead of the macro deployed fleet-wide | Planned |
-| [ADR-002](ADR-002-compute-ec2-rhel.md) | Production compute: EC2 RHEL 9 + systemd (ECS Fargate as fallback) | Accepted |
+| [ADR-002](ADR-002-compute-ec2-rhel.md) | Production compute: EC2 RHEL 9 + systemd | Accepted |
 | ADR-003 | DynamoDB for admin state; room runtime state in memory | Planned |
 | ADR-004 | Long-poll ingress, one consumer per integration, separate integrations per environment | Planned |
 | ADR-005 | Single active instance with a DynamoDB lease | Planned |

@@ -434,11 +434,11 @@ The service embeds a lightweight, server-rendered administration and configurati
 
 ### 8.2 Production Compute on AWS: EC2 RHEL 9 + systemd (Terraform-Provisioned)
 
-The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 instance, and all AWS infrastructure is codified in Terraform. This is a single instance with automated recovery, not high availability. That is acceptable because every outage fails closed: no booking is released while the service is down, and native RoomOS behaviour continues. ECS Fargate was evaluated and is the documented fallback if Suncorp platform standards require containers ([ADR-002](adr/ADR-002-compute-ec2-rhel.md)).
+The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 instance, and all AWS infrastructure is codified in Terraform. This is a single instance with automated recovery, not high availability. That is acceptable because every outage fails closed: no booking is released while the service is down, and native RoomOS behaviour continues. The decision and the alternatives considered are recorded in [ADR-002](adr/ADR-002-compute-ec2-rhel.md).
 
 - **Instance**:
   - One RHEL 9 instance (`t3.medium`, x86_64, provisional until a load test with 800 actors and the security agents confirms the size) in an Auto Scaling Group with Min=1, Max=1, Desired=1, across two private subnets in different Availability Zones.
-  - Built from the Suncorp standard RHEL 9 image, or a hardened RHEL 9 image from EC2 Image Builder, with the SSM Agent (not included in AWS RHEL images, so installed explicitly), CloudWatch agent, and corporate security agents. SELinux stays enforcing; the deploy runbook restores file labels on each release.
+  - Built from the Suncorp standard RHEL 9 server build, with the SSM Agent and CloudWatch agent alongside the corporate agents. SELinux stays enforcing.
   - IMDSv2 only, no key pair, no public IP, encrypted root volume.
   - RHEL licensing is either AWS pay-as-you-go RHEL images or Suncorp's existing subscriptions through Red Hat Cloud Access (to be confirmed with Suncorp Cloud Platform).
 - **Process**:
@@ -446,22 +446,14 @@ The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 i
   - A crashed process is back within seconds and re-acquires its own lease immediately, because the lease holder ID is the instance ID (LLD §8.5).
 - **Release artifact**:
   - CI builds a versioned, checksummed tarball containing the compiled service, production `node_modules`, and a pinned Node.js LTS runtime, and stores it in a versioned S3 bucket. Bundling Node means OS patching never changes the runtime.
-  - The image contains no application code. At boot the instance installs the approved release version recorded in SSM Parameter Store.
-- **Deploy and rollback**:
-  - An SSM Automation runbook installs a release in place: verify the checksum, run preflight checks, switch the `current` symlink, restart the unit, and wait for the local health check. On failure it switches back automatically.
-  - An in-place deploy keeps the instance, so the lease is re-acquired immediately. Previous releases stay on disk for rollback.
-- **Patching**:
-  - Monthly image rebuild, rolled out by Auto Scaling Group instance refresh with `MinHealthyPercentage = 0`, so two instances never overlap.
-  - Urgent security updates are installed in place by SSM Patch Manager (`dnf`), rebooting only when required.
-  - On shutdown the service releases its lease, so a replacement does not wait for it to expire.
-- **Restart window**: every restart quarantines the meetings in progress (§2), so planned deploys, patches, and instance refreshes run between 01:00 and 05:00 Sydney time.
+- **Releases**: a new release is installed on the same server and the service restarted; the server is not rebuilt. The instance ID is unchanged, so the service re-acquires its lease immediately. The previous release stays on the server for rollback. The deployment tooling follows the platform team's standard and is settled in Sprint 2.
+- **Operations**: OS patching and server operations are owned by the Suncorp platform (Wintel) team under its standard server process. The service only requires that planned restarts (patch reboots and releases) happen outside business hours, because each restart quarantines the meetings in progress (§2). On shutdown the service releases its lease, so it never has to wait for it to expire.
 - **Recovery**: a process crash recovers within seconds on the same instance. A host or Availability Zone failure is recovered by the Auto Scaling Group launching a replacement in the other zone, which takes minutes; automation is halted (fail closed) until it is running.
 - **Admin access**: there is no inbound path and no SSH. Admins reach the `127.0.0.1`-bound dashboard through SSM Session Manager port forwarding, authorized by their AWS IAM Identity Center role. CloudTrail records who opened the tunnel but not what happens inside it, so dashboard actions rely on the application audit log (§7.4).
 - **Common Network & Security Architecture**:
   - **VPC Subnets**: Deployed strictly inside private subnets (zero public IP, zero inbound security group rules).
   - **Outbound Egress**:
     - Outbound HTTPS (TCP 443) to Webex Cloud APIs for long-polling telemetry and Control Hub inventory.
-    - Outbound HTTPS to the RHEL package repositories (Red Hat Update Infrastructure, or an internal Satellite) for patching and image builds, through the central egress. The path depends on the RHEL licensing choice.
     - DynamoDB and S3 (release artifacts) through VPC gateway endpoints, and SSM and CloudWatch through interface endpoints or the landing zone's shared endpoints (no internet path).
     - Outbound SMTP (TCP 25) routed across the enterprise network / Direct Connect / Transit Gateway to `outlook.suncorp.com.au`.
   - **Zero Plaintext Secrets**: Webex credentials and secrets injected from AWS SSM Parameter Store (`SecureString`) at startup via IAM role / instance profile.
