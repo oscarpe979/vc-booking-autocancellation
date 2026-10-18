@@ -371,6 +371,7 @@ export interface RoomActorState {
   // Identity-bound policy decision (bound to booking ID + end time)
   autocancellationStatus: AutocancellationStatus;
   blockReason: AutocancellationBlockReason | null;
+  blockReasonSince: Date | null; // When the current blockReason was set; read by health (§7.3)
   desiredNativeCheckInEnabled: boolean | null; // null = no write (VerifyingMeetingLength)
   nativeCheckInSettingApplied: boolean;
 
@@ -790,7 +791,7 @@ Demotion (admin; the system may only demote to DISABLED):
 **Warning email gate** (service-only; applies when `NOTIFICATIONS_ENABLED = true`):
 
 - One warning email is sent per warning deadline. A new deadline (a fresh countdown after Keep Booking, or the unconfirmed-guard restore) sends a new email. Restoring a dismissed prompt keeps the same deadline and sends none. `warningEmailSentForDeadline` records which deadline the last delivered email covered.
-- If delivery fails after bounded immediate retries, or the organizer email is missing or unparseable, `warningEmailFailed` is set for the rest of the lifecycle. The prompt stays visible so occupants can still act, automatic release is blocked at JIT check 9, and no further countdown starts in that lifecycle. It is never cleared by recovery; the next booking lifecycle starts clean.
+- If delivery fails after bounded immediate retries, or the organizer email is missing or unparseable, `warningEmailFailed` is set for the rest of the lifecycle. The prompt stays visible so occupants can still act, automatic release is blocked at JIT check 9, and no further countdown starts in that lifecycle. It is never cleared by recovery; the next booking lifecycle starts clean. SMTP transport failures also count toward the fleet-level `consecutiveSmtpFailures` behind the `EMAIL_DELIVERY_FAILING` health issue (§7.3).
 - In `DRY_RUN`, the `[DRY RUN - WOULD_SEND_EMAIL]` entry for the deadline satisfies the gate; a missing organizer email still blocks.
 - With `NOTIFICATIONS_ENABLED = false`, no warning email is sent and the gate does not block release.
 
@@ -934,6 +935,7 @@ The roster gate is a single in-memory lookup, refreshed whenever the roster chan
 - **Actor start sequence** (per room; mirrors macro spec §6): apply the mode's configuration writes (`DRY_RUN`/`LIVE` only, §5.12), read presence, then read availability and the booking snapshot as one versioned snapshot. If a booking is active, quarantine it (§5.9). Then read codec time and schedule the codec-local midnight check. An event that arrives during these reads wins over the slower read: the snapshot is discarded and re-read (§5.1).
 - **Long-poll connectivity:** the macro is always subscribed; the service can miss events while the long poll is failing. When `IEventIngressTransport` reports a reconnection after an outage (`onConnectivityChange`), every actor re-applies its mode's configuration writes and runs a full revalidation (§5.12, then the readiness reconciliation of §5.3) before any new countdown may start. Active countdowns and prompts are cancelled during the outage only if their JIT validation fails at expiry; the JIT validation already re-reads every input, including uptime (§5.13).
 - **Periodic full sync:** Webex also delivers periodic full-state status notifications (roughly hourly). They are processed like any other status event and are not a substitute for revalidation.
+- **Connectivity state for health (§7.3):** the transport keeps `ingressDisconnectedSince` (set to the process start time, cleared by the first successful poll, set again on each disconnect and cleared only by a reconnect), `lastIngressErrorClass` (`auth` for `401`/`403`, `rateLimited` for `429`, `server` for `5xx`, `network`), and `lastNotificationReceivedAt`, updated for every notification before the roster gate, so discarded events count too.
 
 ```typescript
 export class RoomRegistry {
@@ -963,6 +965,107 @@ export class RoomRegistry {
 
 - **Memory Overhead**: Each `RoomWorkflowCoordinator` instance consumes $\approx 15\text{ KB}$ of RAM. Across 800 rooms, total fleet memory is $\approx 12\text{ MB}$, well within standard Node.js heap limits.
 - **Teardown Safety**: `teardown()` guarantees all active `NodeJS.Timeout` and `Interval` handles are cleared immediately to prevent memory leaks.
+
+### 7.3 Service Health Endpoint and Liveness Monitor
+
+The service reports its own health so the run team hears about any problem without watching a dashboard. Each failure has one owner for recovery and at least one path to an email:
+
+| Failure | Recovery | Alert |
+| :--- | :--- | :--- |
+| Process crashes | systemd restarts it (`Restart=always`) | Monitor: `SERVICE_RESTARTED`, or `SERVICE_CRASH_LOOPING` |
+| Event loop hangs | systemd watchdog kills and restarts it (ADR-002) | Monitor: `SERVICE_RESTARTED` with `Result=watchdog` |
+| Any service issue (codes below) | The service's own fail-closed behaviour | Monitor email |
+| SMTP relay down, or the monitor itself dead | None needed | Backstop alarms through SNS |
+| Whole server down | EC2 automatic recovery (hardware failure); runbook rebuild (Availability Zone outage) | EC2 status-check alarm through SNS |
+
+**Endpoint.**
+
+- `GET /healthz` (and `HEAD`) on the dashboard listener (`127.0.0.1` only). The path is matched exactly and registered before the authentication, session, CSRF, and login rate-limit middleware; no other route is exempt. Responses carry `Cache-Control: no-store`.
+- The listener starts before the store loads and before the lease is acquired, so startup waits are reported as `STORE_UNAVAILABLE` or `LEASE_NOT_HELD` instead of looking like a dead service. If the listener cannot bind, or `ADMIN_DASHBOARD_PASSWORD` is missing, the process exits non-zero before it opens the roster gate.
+- Answered from in-memory state only, with no device, store, or network call.
+- No personal data. `detail` comes only from fixed per-code templates filled with counts, durations, and enum values; it never contains exception messages, email addresses, device IDs, or URLs.
+- `200` with `status: "ok"` when there is no issue, `200` with `status: "degraded"` when every issue is a warning, and `503` with `status: "unhealthy"` when any issue is critical.
+
+```json
+{
+  "status": "unhealthy",
+  "version": "1.4.0",
+  "instanceId": "i-0123456789abcdef0",
+  "processUptimeSeconds": 86400,
+  "checkedAt": "2026-10-19T09:15:00+11:00",
+  "issues": [
+    {
+      "code": "WEBEX_DISCONNECTED",
+      "severity": "critical",
+      "since": "2026-10-19T09:08:12+11:00",
+      "detail": "Long-poll ingress disconnected for 7 minutes (network)"
+    }
+  ]
+}
+```
+
+**State behind the codes.** Each owning component keeps it in memory:
+
+- Ingress transport (§7.2): `ingressDisconnectedSince`, `lastIngressErrorClass`, and `lastNotificationReceivedAt`.
+- Notification adapter: `consecutiveSmtpFailures`, the number of real SMTP sends (warning or cancellation emails) in a row that failed after their bounded retries. Any successful send resets it. A missing or unparseable organizer address and `DRY_RUN` simulated sends do not count (§5.8).
+- Webex adapter: a 15-minute sliding count of device commands and reads by outcome (`ok`, `403`, `429` after backoff, timeout, `5xx`).
+- Event loop: `perf_hooks.monitorEventLoopDelay`, recording the maximum delay per minute.
+- Inventory reconciliation (§8.3): `lastInventorySyncSucceededAt`.
+- Each actor: `blockReasonSince`, the time its current `blockReason` was set (§3.1).
+- Existing state: the store and lease (§8.5), the kill switch sources and tripwire (§5.8, §8.5), and roster flags (§5.7, §8.3).
+
+| Code | Severity | Raised when | Cleared when |
+| :--- | :--- | :--- | :--- |
+| `STORE_UNAVAILABLE` | critical | The fleet configuration store has not loaded since startup, so no room is managed (§8.5). | The store loads. |
+| `STORE_DEGRADED` | critical | Runtime store outage: running on the last-known-good roster and settings, dashboard writes rejected (§8.5). | The store is reachable again. |
+| `LEASE_NOT_HELD` | critical | The instance lease is not held, so every device command is stopped (§8.5). | The lease is acquired. |
+| `WEBEX_DISCONNECTED` | critical | `ingressDisconnectedSince` is older than `HEALTH_WEBEX_DISCONNECT_ALERT_MS`; `detail` names `lastIngressErrorClass`. | The long poll reconnects. |
+| `WEBEX_EVENTS_SILENT` | critical | The long poll reports connected, but no notification has arrived for `HEALTH_WEBEX_SILENCE_ALERT_MS` (twice the periodic full-sync interval). | A notification arrives. |
+| `EVENT_LOOP_STALLED` | critical | The maximum event-loop delay in the last minute exceeded `HEALTH_EVENT_LOOP_LAG_ALERT_MS`. | A full minute stays under the threshold. |
+| `TRIPWIRE_TRIPPED` | critical | The tripwire has tripped; automation is halted until an admin resets it (§5.8). | An admin resets it. |
+| `EMAIL_DELIVERY_FAILING` | critical | `consecutiveSmtpFailures` reached `HEALTH_EMAIL_FAILURE_ALERT_COUNT`; releases that need a warning email are blocked (§5.8). | A send succeeds. |
+| `ROOMS_BLOCKED_BY_FAULT` | critical | At least `HEALTH_BLOCKED_ROOM_ALERT_RATIO` of `DRY_RUN`/`LIVE` actors, and at least 3, have held a fault block reason (`RequiredConfigurationsUnavailable`, `NativeCheckInSettingUnavailable`, a presence, booking, or codec-time readiness failure) for longer than 15 minutes. Quarantine, exemptions, and `VerifyingMeetingLength` do not count. `detail` gives the count per reason. | The share drops below the threshold. |
+| `KILL_SWITCH_PARAMETER_UNREADABLE` | critical if never read since startup (it then counts as active, so automation is halted); otherwise warning | `AUTOCANCEL_KILL_SWITCH` could not be read; its last value is kept (§8.5). | A read succeeds. |
+| `KILL_SWITCH_ACTIVE` | warning | The kill switch is active; `detail` names the source (dashboard, parameter, or both). | It is deactivated. |
+| `DEVICE_COMMANDS_FAILING` | warning | More than `HEALTH_DEVICE_FAILURE_ALERT_RATIO` of device commands and reads failed in the last 15 minutes; `detail` gives the count per outcome. | The share drops below the threshold. |
+| `INVENTORY_SYNC_STALE` | warning | No successful inventory reconciliation for `HEALTH_INVENTORY_STALE_ALERT_MS` (§8.3). | A reconciliation succeeds. |
+| `ROOMS_NEED_ATTENTION` | warning | A room whose mode is not `DISABLED` is `Missing` or `CleanupIncomplete`, or the system demoted a room (`DeviceMismatch`) in the last 7 days. Discovered, `AmbiguousWorkspace`, and `DISABLED` entries are dashboard-only and never reported here. | No such room remains. |
+
+**Liveness monitor.**
+
+- A bash script, `/opt/booking-autocancel/bin/healthcheck.sh`, run every 60 seconds by its own systemd timer (`booking-autocancel-health.timer`) as its own unprivileged user, independent of the service unit. It needs only `curl` and `jq` from the server build. Its settings (distribution list, relay, thresholds) live in `/etc/booking-autocancel/healthcheck.conf`, root-owned and read as `key=value` pairs, never executed.
+- **Probe:** `curl --noproxy '*' --max-time 5 http://127.0.0.1:<port>/healthz`. No answer, a timeout, or a body that is not the expected JSON is the critical issue `SERVICE_UNREACHABLE`, and its email includes systemd's `ActiveState` and `Result` for the service unit.
+- **Host checks** on every run:
+  - `NRestarts` from `systemctl show`: any increase raises the warning `SERVICE_RESTARTED` with the unit's `Result` (for example `watchdog`, `exit-code`, `oom-kill`), emailed once without waiting, because every restart quarantines the meetings in progress. Three or more restarts within an hour raise the critical `SERVICE_CRASH_LOOPING`.
+  - `DISK_SPACE_LOW` (warning): less than 10% free on `/var`.
+  - `CLOCK_NOT_SYNCHRONIZED` (warning): `timedatectl` reports the clock unsynchronized; the lease (§8.5) and JIT timing depend on it.
+- **Debounce:** a code is alerted after 3 consecutive checks report it, and counts as cleared after 3 consecutive checks without it.
+- **Emails:**
+  - One email when a code appears and one when it clears. A change in `detail` alone sends nothing.
+  - Reminders while a code persists: every `HEALTH_CRITICAL_REMINDER_MS` for critical codes, and once a day at 09:00 local time for warnings.
+  - Sent through the corporate SMTP relay to the run-team distribution list, listing the issues with the host and instance ID, and no personal data.
+- **Email only:** it never restarts the service; systemd and its watchdog own restarts.
+- **State** is written atomically (temporary file, then rename) to `/var/lib/booking-autocancel/health-state.json`.
+- **Log line:** every run writes one line to journald, `healthcheck result=<ok|degraded|unhealthy|unreachable> codes=<list>`, which reaches CloudWatch Logs.
+
+**Backstop alarms (SNS, independent of the SMTP relay).** Three CloudWatch alarms publish to one SNS topic to which the run-team distribution list is subscribed. The subscription is confirmed during provisioning, and the Terraform output records its status. All three treat missing data as breaching.
+
+- **Monitor silent:** fewer than one monitor log line in 10 minutes (the timer, the script, or log shipping has stopped).
+- **Service unhealthy:** `result=unhealthy` or `result=unreachable` in each of the last 10 minutes. This still emails when the SMTP relay is down.
+- **Server down:** the EC2 `StatusCheckFailed` metric. EC2 automatic recovery (on by default for `t3`) restarts the instance on healthy hardware after a *system* status-check failure and keeps its instance ID, so the service re-acquires its lease immediately. An *instance* status-check failure (an operating system hang) is not recovered automatically; the alarm prompts a manual reboot.
+
+**Constants.**
+
+| Constant | Default |
+| :--- | :--- |
+| `HEALTH_WEBEX_DISCONNECT_ALERT_MS` | 5 minutes |
+| `HEALTH_WEBEX_SILENCE_ALERT_MS` | 2 hours |
+| `HEALTH_EVENT_LOOP_LAG_ALERT_MS` | 2 seconds |
+| `HEALTH_EMAIL_FAILURE_ALERT_COUNT` | 3 |
+| `HEALTH_BLOCKED_ROOM_ALERT_RATIO` | 25% |
+| `HEALTH_DEVICE_FAILURE_ALERT_RATIO` | 20% |
+| `HEALTH_INVENTORY_STALE_ALERT_MS` | 45 minutes (three sweeper intervals) |
+| `HEALTH_CRITICAL_REMINDER_MS` | 4 hours |
 
 ---
 
@@ -1021,8 +1124,8 @@ The inventory sync runs at startup and with the Tier 2 sweeper (every 15 minutes
 - **Runtime outage:** the service keeps operating on the last-known-good roster and settings already in memory. The dashboard rejects every write, with one exception: **activating** the kill switch applies in memory immediately, is shown as `active (not persisted)`, and is retried until it is persisted. **Deactivating** the kill switch requires a successful persist.
 - **Second kill-switch source:** the kill switch is active if *either* the store item *or* the `AUTOCANCEL_KILL_SWITCH` SSM/environment parameter is true. The service re-reads the SSM parameter every 30 seconds (`KILL_SWITCH_PARAMETER_POLL_MS`), so operators can halt the fleet within 30 seconds, without a restart, even when the store or the localhost-only dashboard is unavailable. An unreadable parameter keeps its last value; a parameter that has never been read since startup is treated as active.
 - **Tripwire:** when it trips, it writes `tripwireTrippedAt`. It stays tripped across restarts until an admin resets it.
-- **Single active instance:** before opening the roster gate, the service acquires the `INSTANCE_LEASE` item with a conditional write (a holder ID and an expiry roughly 30s ahead, renewed every 10s). This prevents two instances (for example, a replacement EC2 instance starting while the old one is still running) from driving the same rooms.
-  - **Holder ID:** a stable host identity (the EC2 instance ID under `systemd`), so a quick process restart on the same host re-acquires its own lease immediately. A replacement instance has a new identity and waits for the old lease to expire (at most about 30 s) before it manages rooms, unless the old process released the lease on shutdown.
+- **Single active instance:** before opening the roster gate, the service acquires the `INSTANCE_LEASE` item with a conditional write (a holder ID and an expiry roughly 30s ahead, renewed every 10s). This prevents two instances (for example, a rebuilt server starting while the old one is still running) from driving the same rooms.
+  - **Holder ID:** a stable host identity (the EC2 instance ID under `systemd`), so a quick process restart on the same host re-acquires its own lease immediately. A rebuilt server has a new identity and waits for the old lease to expire (at most about 30 s) before it manages rooms, unless the old process released the lease on shutdown.
   - **Lease loss:** if the lease cannot be renewed before it expires (another holder took it, or the store is unreachable), the instance immediately stops every device command and configuration write and stops starting workflows. It does not try to clear prompts, because it can no longer prove it owns the rooms; any visible prompt simply expires on the device. Actors keep tracking state. When the lease is re-acquired, every actor re-applies its mode's configuration writes and runs a full revalidation (§5.12, §7.2) before automation resumes. A store outage longer than the lease therefore halts automation fleet-wide, which is the fail-closed outcome.
 
 ### 8.6 Promotion Readiness Report

@@ -27,7 +27,7 @@ The service:
 5. Decouples hardware presence and interaction from calendar operations through standard driver interfaces, allowing Phase 1 to operate against Cisco Webex Workspace Integrations while allowing future hardware swaps to be performed simply by authoring new driver modules.
 6. Provides fleet-wide operational safety controls including per-room modes (`DISABLED` by default, then `MONITOR_ONLY`, `DRY_RUN`, `LIVE`), an automated cancellation spike tripwire, and an instant emergency kill-switch.
 7. Delivers direct end-user notifications via an enterprise corporate SMTP relay (`outlook.suncorp.com.au:25`), sending urgent cancellation warnings when in-room prompts appear and contextual cancellation receipts when rooms are released, with a strict fail-closed delivery guard protecting bookings if email delivery fails.
-8. Deploys into AWS via Terraform as one `systemd`-supervised process on a single EC2 RHEL 9 instance (Auto Scaling Group of one across two Availability Zones), operating inside private VPC subnets with outbound HTTPS 443 and SMTP 25 egress.
+8. Deploys into AWS via Terraform as one `systemd`-supervised process on a single EC2 RHEL 9 instance, operating inside private VPC subnets with outbound HTTPS 443 and SMTP 25 egress.
 
 ---
 
@@ -79,6 +79,7 @@ The service:
 44. As a meeting organizer, I want the warning email to tell me plainly that my room was detected as empty, when the reservation will be released, and that it is not released if someone is in the room at that time or keeps it using the touch controller in the room, so that I know what will happen without the email asking me to act on it.
 45. As an in-room meeting participant, I want a booking preserved if the room device reboots during a countdown or visible warning, so that a warning wiped by the reboot can never lead to a release I was not shown.
 46. As an enterprise IT collaboration administrator, I want the service to re-apply each enrolled room's required settings every night (spread over a short window), after recovery, and after a reconnect, exactly as the macro does at midnight, so that a setting changed on a device is corrected without manual work.
+47. As a member of the run team, I want an email whenever the service reports any health issue (or cannot be reached, or its server is down), naming the issue, with a reminder while it persists and a notice when it clears, so that I learn about problems without watching a dashboard.
 
 ---
 
@@ -146,12 +147,13 @@ To accommodate corporate development laptop security constraints alongside priva
 
 ### 9. Target Production Infrastructure on AWS (Terraform-Provisioned)
 
-- **Compute: EC2 RHEL 9 + `systemd`** ([ADR-002](adr/ADR-002-compute-ec2-rhel.md)): one `t3.medium` instance (provisional until load-tested) in an Auto Scaling Group (Min=1, Max=1, Desired=1) across two Availability Zones, built from the Suncorp standard RHEL 9 server build, with the Node.js process supervised by `systemd` (`Restart=always`, watchdog). Releases are versioned packages with a pinned Node.js runtime, installed on the same server. OS patching is owned by the Suncorp platform (Wintel) team; the service requires only that planned restarts happen outside business hours.
+- **Compute: EC2 RHEL 9 + `systemd`** ([ADR-002](adr/ADR-002-compute-ec2-rhel.md)): one `t3.medium` instance (provisional until load-tested) in a private subnet, built from the Suncorp standard RHEL 9 server build, with the Node.js process supervised by `systemd` (`Restart=always`, watchdog). Releases are versioned packages with a pinned Node.js runtime, installed on the same server. OS patching is owned by the Suncorp platform (Wintel) team; the service requires only that planned restarts happen outside business hours.
 - **Private Subnets & Egress**: Runs strictly inside private VPC subnets with outbound HTTPS 443 egress to Webex Cloud and outbound TCP 25 egress routed to `outlook.suncorp.com.au` via corporate network connections.
 - **Zero Plaintext Credentials**: Credentials and tokens fetched at startup from AWS SSM Parameter Store (`SecureString`) via IAM roles.
 - **Fleet Configuration Store**: Three on-demand DynamoDB tables (rooms, settings, append-only audit), with point-in-time recovery and deletion protection, reached through a VPC gateway endpoint. A DynamoDB lease ensures a single active service instance.
-- **Observability**: the CloudWatch agent forwards structured JSON logs from journald to CloudWatch Log Groups, with metric alarms.
+- **Observability**: the CloudWatch agent forwards structured JSON logs from journald to CloudWatch Log Groups, with metric filters for cancellation counts. Run-team alerting is described under Health & Run-Team Alerting.
 - **Admin Access**: no inbound path and no SSH; admins reach the localhost dashboard through SSM Session Manager port forwarding.
+- **Health & Run-Team Alerting**: `GET /healthz` on `127.0.0.1` reports every current issue with a code and reason (store, lease, Webex connection and event stream, event loop, tripwire, kill switch, email delivery, rooms blocked by faults, failing device commands, stale inventory, rooms needing attention). A bash liveness monitor on a systemd timer probes it every 60 seconds, also watches service restarts, disk space, and clock sync, and emails the run-team distribution list when an issue persists, with reminders and a recovery email; it never restarts the service. Backstop CloudWatch alarms email the same list through SNS if the monitor goes silent, the service stays unhealthy (including while the SMTP relay is down), or the server goes down. EC2 automatic recovery handles hardware failure; an Availability Zone outage fails closed until the server is rebuilt ([ServiceLowLevelDesign.md §7.3](ServiceLowLevelDesign.md)).
 
 ### 10. In-Room Audio Chimes, Dual Presentation & Dismissed Prompt Restoration
 
@@ -199,7 +201,7 @@ To accommodate corporate development laptop security constraints alongside priva
 - Admin-controlled state (the roster, room modes, the kill switch, the tripped tripwire, timings, exemptions, and SMTP settings) and an append-only audit log are persisted behind the `IFleetConfigStore` port. They are implemented by `DynamoFleetConfigStore` in AWS and `JsonFileFleetConfigStore` on a laptop, so local development still needs no database.
 - Every change is a conditional (versioned) write that is persisted before it takes effect, and is audited with who, when, before, and after.
 - **Fail closed:** if the store cannot be read at startup, the service manages no room until it loads, and it never falls back to defaults. During a runtime outage, the service keeps the last-known-good state and rejects dashboard writes, except kill-switch activation.
-- A DynamoDB lease guarantees that only one service instance drives rooms at a time. Its holder ID is a stable host identity, so a quick process restart re-acquires it immediately, while a replacement instance may wait about 30 seconds for the old lease to expire unless the old process released it on shutdown. Losing the lease stops every device command and configuration write.
+- A DynamoDB lease guarantees that only one service instance drives rooms at a time. Its holder ID is a stable host identity, so a quick process restart re-acquires it immediately, while a rebuilt server (new instance ID) may wait about 30 seconds for the old lease to expire unless the old process released it on shutdown. Losing the lease stops every device command and configuration write.
 - Delivery: Sprint 1 uses the JSON-file adapter; the DynamoDB adapter and its Terraform follow in Sprint 2.
 - Details: [ServiceLowLevelDesign.md §8](ServiceLowLevelDesign.md).
 

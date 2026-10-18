@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-10-17)
 - **Deciders:** Service owner
-- **Related:** [ServiceHighLevelDesign.md §8.2](../ServiceHighLevelDesign.md), [ServiceLowLevelDesign.md §8.5](../ServiceLowLevelDesign.md)
+- **Related:** [ServiceHighLevelDesign.md §8.2](../ServiceHighLevelDesign.md), [ServiceLowLevelDesign.md §7.3, §8.5](../ServiceLowLevelDesign.md)
 
 ## Context
 
@@ -15,13 +15,14 @@ Two properties shape the hosting choice:
 
 ## Decision
 
-Run the service as one `systemd`-supervised Node.js process on a single EC2 RHEL 9 instance, in an Auto Scaling Group fixed at one instance across two Availability Zones, provisioned by Terraform.
+Run the service as one `systemd`-supervised Node.js process on a single EC2 RHEL 9 instance in a private subnet, provisioned by Terraform. There is no Auto Scaling Group.
 
 - **Server:** the Suncorp standard RHEL 9 server build with the corporate agents, the CloudWatch agent, and the SSM Agent (AWS RHEL images do not include it, so the build must). SELinux enforcing, IMDSv2 required, no key pair, no public IP. Size `t3.medium`, provisional until a load test with 800 actors and the corporate agents confirms it.
 - **Release:** a versioned, checksummed tarball containing the compiled service, production dependencies, and a pinned Node.js LTS runtime, stored in a versioned S3 bucket. OS patching never changes the runtime.
-- **Supervision:** `Restart=always`, a systemd watchdog, and systemd sandboxing, running as a dedicated non-login user. Node cannot write to the systemd notify socket itself, so the watchdog is pinged from an event-loop timer (a blocked loop misses it) through either the `sd-notify` native addon, built against RHEL 9 `libsystemd` and bundled in the release, or by spawning `systemd-notify` with `NotifyAccess=all`. The lease holder ID is the instance ID, so a crashed process re-acquires its own lease immediately.
-- **Releases:** a new release is installed on the same server and the service restarted; the server is not rebuilt, so the instance ID and the lease are kept. The previous release stays on the server for rollback. A replacement instance launched by the Auto Scaling Group installs the current approved release automatically at boot, so no manual step is needed after a failover. The deployment tooling follows the platform team's standard (Sprint 2).
+- **Supervision:** `Restart=always` (`RestartSec=5`, `StartLimitIntervalSec=0` so systemd never gives up), a systemd watchdog (`WatchdogSec=30`, pinged every 10 seconds), and systemd sandboxing, running as a dedicated non-login user. Node cannot write to the systemd notify socket itself, so the watchdog is pinged from an event-loop timer (a blocked loop misses it) through either the `sd-notify` native addon, built against RHEL 9 `libsystemd` and bundled in the release, or by spawning `systemd-notify` with `NotifyAccess=all`. The lease holder ID is the instance ID, so a crashed process re-acquires its own lease immediately.
+- **Releases:** a new release is installed on the same server and the service restarted; the server is not rebuilt, so the instance ID and the lease are kept. The previous release stays on the server for rollback. The deployment tooling follows the platform team's standard (Sprint 2).
 - **Operations:** OS patching and server operations are owned by the Suncorp platform (Wintel) team under its standard server process. The service only requires that planned restarts (patch reboots and releases) happen outside business hours, because each restart quarantines the meetings in progress. The service releases its lease on shutdown.
+- **Health and recovery:** systemd restarts a crashed process and its watchdog restarts a hung one. EC2 automatic recovery restarts the instance on healthy hardware after a hardware failure, keeping its instance ID. A bash liveness monitor on a systemd timer probes `GET /healthz`, watches restarts, and emails the run-team distribution list. Backstop CloudWatch alarms email the same list through SNS if the monitor goes silent, the service stays unhealthy, or the server goes down (LLD §7.3).
 - **Admin access:** SSM Session Manager port forwarding (`AWS-StartPortForwardingSession`) to the `127.0.0.1` dashboard; no inbound path and no SSH. CloudTrail records who opened each tunnel, but not what happens inside it, so dashboard actions rely on the application audit log.
 
 ## Alternatives Considered
@@ -31,12 +32,13 @@ Run the service as one `systemd`-supervised Node.js process on a single EC2 RHEL
 | **AWS ECS Fargate (containers)** | Rejected. AWS restarts Fargate tasks for its own platform maintenance (schedulable only on a best-effort basis), and every restart quarantines the fleet's meetings in progress; each replacement task has a new identity, so it waits for the old lease to expire; reaching a localhost dashboard needs ECS Exec with a target that changes on every restart; and it adds a container platform for a single process. |
 | **Serverless (webhooks, Lambda, EventBridge Scheduler, state in DynamoDB)** | Webhooks need a public HTTPS endpoint, while long-polling needs none. Persisting per-room timers and generation guards as distributed state would rebuild the validated macro logic in a new form and contradicts the in-memory runtime design (LLD §8.1). |
 | **On-premises RHEL VM** | Close to the SMTP relay, but against the AWS target platform, and the DynamoDB lease would depend on the Direct Connect path. |
+| **Auto Scaling Group of one across two Availability Zones** | Rejected for simplicity. It would replace the server automatically after an Availability Zone outage, but the outcome during any outage is the same (fail closed: bookings are kept), a replacement has a new identity and waits for the old lease, and a single long-lived server is simpler for the platform team to operate. |
 | **Active/standby or sharded instances** | Any takeover still quarantines every meeting in progress, so a second instance adds cost and failure modes without adding releases. |
 
 ## Consequences
 
 - **Positive:** restarts happen only when scheduled; a process crash recovers within seconds with the same lease; the admin access path is standard SSM; no container platform is introduced for one process; the server is operated by the existing Suncorp platform team under its standard process.
-- **Negative:** the service depends on the platform team scheduling patch reboots outside business hours. A host or Availability Zone failure takes minutes to recover (automation halted, failing closed, until the replacement runs). Liveness needs the systemd watchdog and a heartbeat alarm, because the Auto Scaling Group only sees EC2 status checks unless the service reports custom health (`SetInstanceHealth`).
+- **Negative:** the service depends on the platform team scheduling patch reboots outside business hours. An Availability Zone outage stops automation (bookings are kept) until the zone returns or the server is rebuilt by runbook. A hardware failure is covered by EC2 automatic recovery.
 
 ## Revisit If
 

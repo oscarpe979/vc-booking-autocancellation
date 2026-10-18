@@ -17,7 +17,7 @@ The validated macro and its [specification](../../codec-native/docs/BookingAutoC
 - **Hardware Agnosticism**: Standardized Hardware Abstraction Layer (HAL) allowing future replacement or augmentation of codecs with alternative hardware vendors (e.g., Poly, Neat, Logitech) or third-party occupancy sensors.
 - **Runtime Environment**:
   - **Local Development**: Node.js / TypeScript running locally on engineer workstations via outbound long-polling (zero inbound firewall pinholes, zero ngrok/tunneling required) with mock email logging.
-  - **Production Target (AWS)**: Modular infrastructure provisioned via Terraform, designed to run with maximum operational simplicity in private VPC subnets with outbound connectivity to Webex (HTTPS 443) and corporate SMTP (`outlook.suncorp.com.au:25`). Runs as one `systemd`-supervised Node.js process on a single AWS EC2 RHEL 9 instance in a Min=1, Max=1 Auto Scaling Group across two Availability Zones (§8.2, ADR-002).
+  - **Production Target (AWS)**: Modular infrastructure provisioned via Terraform, designed to run with maximum operational simplicity in private VPC subnets with outbound connectivity to Webex (HTTPS 443) and corporate SMTP (`outlook.suncorp.com.au:25`). Runs as one `systemd`-supervised Node.js process on a single AWS EC2 RHEL 9 instance (§8.2, ADR-002).
 
 ---
 
@@ -434,10 +434,10 @@ The service embeds a lightweight, server-rendered administration and configurati
 
 ### 8.2 Production Compute on AWS: EC2 RHEL 9 + systemd (Terraform-Provisioned)
 
-The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 instance, and all AWS infrastructure is codified in Terraform. This is a single instance with automated recovery, not high availability. That is acceptable because every outage fails closed: no booking is released while the service is down, and native RoomOS behaviour continues. The decision and the alternatives considered are recorded in [ADR-002](adr/ADR-002-compute-ec2-rhel.md).
+The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 instance, and all AWS infrastructure is codified in Terraform. This is a single server, not high availability. That is acceptable because every outage fails closed: no booking is released while the service is down, and native RoomOS behaviour continues. The decision and the alternatives considered are recorded in [ADR-002](adr/ADR-002-compute-ec2-rhel.md).
 
 - **Instance**:
-  - One RHEL 9 instance (`t3.medium`, x86_64, provisional until a load test with 800 actors and the security agents confirms the size) in an Auto Scaling Group with Min=1, Max=1, Desired=1, across two private subnets in different Availability Zones.
+  - One RHEL 9 instance (`t3.medium`, x86_64, provisional until a load test with 800 actors and the security agents confirms the size) in a private subnet.
   - Built from the Suncorp standard RHEL 9 server build, with the SSM Agent and CloudWatch agent alongside the corporate agents. SELinux stays enforcing.
   - IMDSv2 only, no key pair, no public IP, encrypted root volume.
   - RHEL licensing is either AWS pay-as-you-go RHEL images or Suncorp's existing subscriptions through Red Hat Cloud Access (to be confirmed with Suncorp Cloud Platform).
@@ -446,9 +446,10 @@ The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 i
   - A crashed process is back within seconds and re-acquires its own lease immediately, because the lease holder ID is the instance ID (LLD §8.5).
 - **Release artifact**:
   - CI builds a versioned, checksummed tarball containing the compiled service, production `node_modules`, and a pinned Node.js LTS runtime, and stores it in a versioned S3 bucket. Bundling Node means OS patching never changes the runtime.
-- **Releases**: a new release is installed on the same server and the service restarted; the server is not rebuilt. The instance ID is unchanged, so the service re-acquires its lease immediately. The previous release stays on the server for rollback. A replacement instance launched by the Auto Scaling Group installs the current approved release automatically at boot, so no manual step is needed after a failover. The deployment tooling follows the platform team's standard and is settled in Sprint 2.
+- **Releases**: a new release is installed on the same server and the service restarted; the server is not rebuilt. The instance ID is unchanged, so the service re-acquires its lease immediately. The previous release stays on the server for rollback. The deployment tooling follows the platform team's standard and is settled in Sprint 2.
 - **Operations**: OS patching and server operations are owned by the Suncorp platform (Wintel) team under its standard server process. The service only requires that planned restarts (patch reboots and releases) happen outside business hours, because each restart quarantines the meetings in progress (§2). On shutdown the service releases its lease, so it never has to wait for it to expire.
-- **Recovery**: a process crash recovers within seconds on the same instance. A host or Availability Zone failure is recovered by the Auto Scaling Group launching a replacement in the other zone, which takes minutes; automation is halted (fail closed) until it is running.
+- **Recovery**: a process crash recovers within seconds on the same instance (systemd), and a hung process is restarted by the systemd watchdog. EC2 automatic recovery restarts the instance on healthy hardware after a hardware failure, keeping its instance ID. An Availability Zone outage stops automation (fail closed: bookings are kept) until the zone returns or the server is rebuilt.
+- **Health monitoring**: the service exposes `GET /healthz` on `127.0.0.1`, which lists every current issue with a code and reason: store, lease, Webex connection, silent event stream, event loop, tripwire, kill switch, email delivery, rooms blocked by faults, failing device commands, stale inventory, and rooms needing attention. A bash liveness monitor, run every 60 seconds by a systemd timer, probes it, also watches service restarts, disk space, and clock sync, and emails the run-team distribution list through the corporate SMTP relay when an issue persists, with reminders and a recovery email. It never restarts the service. Backstop CloudWatch alarms send email through SNS, independently of the relay, if the monitor goes silent, the service stays unhealthy, or the server goes down. Contract: LLD §7.3.
 - **Admin access**: there is no inbound path and no SSH. Admins reach the `127.0.0.1`-bound dashboard through SSM Session Manager port forwarding, authorized by their AWS IAM Identity Center role. CloudTrail records who opened the tunnel but not what happens inside it, so dashboard actions rely on the application audit log (§7.4).
 - **Common Network & Security Architecture**:
   - **VPC Subnets**: Deployed strictly inside private subnets (zero public IP, zero inbound security group rules).
@@ -457,12 +458,12 @@ The service runs as one `systemd`-supervised Node.js process on one EC2 RHEL 9 i
     - DynamoDB and S3 (release artifacts) through VPC gateway endpoints, and SSM and CloudWatch through interface endpoints or the landing zone's shared endpoints (no internet path).
     - Outbound SMTP (TCP 25) routed across the enterprise network / Direct Connect / Transit Gateway to `outlook.suncorp.com.au`.
   - **Zero Plaintext Secrets**: Webex credentials and secrets injected from AWS SSM Parameter Store (`SecureString`) at startup via IAM role / instance profile.
-  - **Observability**: the CloudWatch agent forwards the service's structured JSON logs from journald to CloudWatch Logs, with metric filters for cancellation counts and alarms on tripwire triggers and a missing heartbeat.
+  - **Observability**: the CloudWatch agent forwards the service's structured JSON logs from journald to CloudWatch Logs, with metric filters for cancellation counts. Run-team alerting is the health monitor and the EC2 status-check alarm (Health monitoring above).
 
 ### 8.3 Fleet Configuration Store (DynamoDB)
 
 - Three on-demand tables: rooms (roster), settings (global settings and the single-instance lease), and an append-only audit table. All have point-in-time recovery, deletion protection, and encryption at rest, and are provisioned by Terraform.
 - The tables are reached from the private subnets through a **DynamoDB VPC gateway endpoint**, so no internet egress is needed. The service IAM role is scoped to these three tables, and has no update or delete permission on the audit table.
 - Room runtime state stays in memory; only admin-controlled state is durable. If the store is unreachable at startup, the service manages nothing until it loads.
-- A DynamoDB lease item ensures only one service instance drives rooms at a time (for example, if a replacement instance starts while the old one is still running). The holder ID is a stable host identity, so a process restart on the same host re-acquires its lease immediately; losing the lease stops every device command.
+- A DynamoDB lease item ensures only one service instance drives rooms at a time (for example, if a rebuilt server starts while the old one is still running). The holder ID is a stable host identity, so a process restart on the same host re-acquires its lease immediately; losing the lease stops every device command.
 - Details: [ServiceLowLevelDesign.md §8](ServiceLowLevelDesign.md).
