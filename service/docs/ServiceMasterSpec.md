@@ -79,7 +79,7 @@ The service:
 44. As a meeting organizer, I want the warning email to tell me plainly that my room was detected as empty, when the reservation will be released, and that it is not released if someone is in the room at that time or keeps it using the touch controller in the room, so that I know what will happen without the email asking me to act on it.
 45. As an in-room meeting participant, I want a booking preserved if the room device reboots during a countdown or visible warning, so that a warning wiped by the reboot can never lead to a release I was not shown.
 46. As an enterprise IT collaboration administrator, I want the service to re-apply each enrolled room's required settings every night (spread over a short window), after recovery, and after a reconnect, exactly as the macro does at midnight, so that a setting changed on a device is corrected without manual work.
-47. As a member of the run team, I want an email whenever the service reports a health issue or cannot be reached, naming the issue, with a reminder while it persists and a notice when it clears, so that I learn about problems without watching a dashboard.
+47. As a member of the run team, I want a Dynatrace problem whenever the service reports a health issue, goes silent, restarts, or loses its server, naming the issue and closing when it clears, so that I learn about problems in the tool I already use.
 
 ---
 
@@ -151,9 +151,9 @@ To accommodate corporate development laptop security constraints alongside priva
 - **Private Subnets & Egress**: Runs strictly inside private VPC subnets with outbound HTTPS 443 egress to Webex Cloud and outbound TCP 25 egress routed to `outlook.suncorp.com.au` via corporate network connections.
 - **Zero Plaintext Credentials**: Credentials and tokens fetched at startup from AWS SSM Parameter Store (`SecureString`) via IAM roles.
 - **Fleet Configuration Store**: Three on-demand DynamoDB tables (rooms, settings, append-only audit), with point-in-time recovery and deletion protection, reached through a VPC gateway endpoint. A DynamoDB lease ensures a single active service instance.
-- **Observability**: the CloudWatch agent forwards structured JSON logs from journald to CloudWatch Log Groups, with metric filters for cancellation counts. Run-team alerting is described under Health & Run-Team Alerting.
+- **Observability**: the CloudWatch agent forwards structured JSON logs from journald to CloudWatch Log Groups, with metric filters for cancellation counts. Run-team alerting is Dynatrace (Health & Run-Team Alerting below).
 - **Admin Access**: no inbound path and no SSH; admins reach the localhost dashboard through SSM Session Manager port forwarding.
-- **Health & Run-Team Alerting**: `GET /healthz` on `127.0.0.1` reports the core issues (store, lease, Webex connection, event loop, tripwire, kill switch, email delivery) with a code and reason. A bash script on a systemd timer probes it every 60 seconds, notices service restarts, and emails the run-team distribution list through the corporate SMTP relay when an issue appears and when it clears; it never restarts the service. EC2 automatic recovery handles hardware failure; an Availability Zone outage fails closed until the server is rebuilt ([ServiceLowLevelDesign.md §7.3](ServiceLowLevelDesign.md)).
+- **Health & Run-Team Alerting**: `GET /healthz` on `127.0.0.1` reports the core issues (store, lease, Webex connection, event loop, tripwire, kill switch, email delivery) with a code and reason, and the service pushes the same snapshot every minute to the local Dynatrace OneAgent as metrics. Dynatrace, which the run team already uses, raises the alerts: per-code metric events, a missing-data alert when the service or server goes silent, a process availability rule, and its built-in restart and host availability events. No custom monitor script and no SMTP relay are involved. EC2 automatic recovery handles hardware failure; an Availability Zone outage fails closed until the server is rebuilt ([ServiceLowLevelDesign.md §7.3](ServiceLowLevelDesign.md)).
 
 ### 10. In-Room Audio Chimes, Dual Presentation & Dismissed Prompt Restoration
 

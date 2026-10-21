@@ -965,9 +965,9 @@ export class RoomRegistry {
 - **Memory Overhead**: Each `RoomWorkflowCoordinator` instance consumes $\approx 15\text{ KB}$ of RAM. Across 800 rooms, total fleet memory is $\approx 12\text{ MB}$, well within standard Node.js heap limits.
 - **Teardown Safety**: `teardown()` guarantees all active `NodeJS.Timeout` and `Interval` handles are cleared immediately to prevent memory leaks.
 
-### 7.3 Service Health Endpoint and Liveness Monitor
+### 7.3 Service Health Endpoint and Dynatrace Alerting
 
-The first release keeps alerting deliberately small: the service reports its core health, and one script emails the run team through the corporate SMTP relay. systemd restarts a crashed process, and its watchdog restarts a hung one (ADR-002); the monitor only reports.
+The first release keeps alerting deliberately small and uses Dynatrace, which the run team already watches. The service reports its core health through `/healthz` and pushes the same snapshot to the local Dynatrace OneAgent; Dynatrace raises and routes the alerts. systemd restarts a crashed process, and its watchdog restarts a hung one (ADR-002). The service never alerts anyone directly.
 
 **Endpoint.**
 
@@ -1003,17 +1003,28 @@ The first release keeps alerting deliberately small: the service reports its cor
 | `EMAIL_DELIVERY_FAILING` | critical | `HEALTH_EMAIL_FAILURE_ALERT_COUNT` (3) SMTP sends in a row failed after their bounded retries (`consecutiveSmtpFailures` in the notification adapter; a missing organizer address and `DRY_RUN` sends do not count). Releases that need a warning email are blocked (§5.8). | A send succeeds. |
 | `KILL_SWITCH_ACTIVE` | warning | The kill switch is active, including a parameter never read since startup (§8.5); `detail` names the source. | It is deactivated. |
 
-**Liveness monitor.**
+**Health push to Dynatrace.**
 
-- A bash script, `/opt/booking-autocancel/bin/healthcheck.sh`, run every 60 seconds by its own systemd timer (`booking-autocancel-health.timer`), independent of the service unit. It uses `curl` and `jq`. Its settings (distribution list, relay) live in `/etc/booking-autocancel/healthcheck.conf`.
-- It probes `/healthz` with `curl --noproxy '*' --max-time 5`. No answer, a timeout, or an unexpected body is the critical issue `SERVICE_UNREACHABLE`.
-- It reads the unit's restart count (`systemctl show -p NRestarts`). Any increase raises `SERVICE_RESTARTED`, emailed once, because every restart quarantines the meetings in progress.
-- A code is alerted after 3 consecutive checks report it, and counts as cleared after 3 consecutive checks without it.
-- It emails the run-team distribution list through the corporate SMTP relay when a code appears and when it clears, with a reminder every 4 hours while a code persists. Each email lists the codes and details, the host, and no personal data. Its state lives in `/var/lib/booking-autocancel/health-state.json`.
-- It never restarts the service.
-- Every run logs one line to journald (`healthcheck result=<ok|degraded|unhealthy|unreachable> codes=<list>`), which reaches CloudWatch Logs.
+- Every `HEALTH_PUSH_INTERVAL_MS` (60 seconds) and whenever the issue set changes, the service posts the same in-memory snapshot that `/healthz` returns to the OneAgent local metric ingest API (`DYNATRACE_METRIC_INGEST_URL`, default `http://localhost:14499/metrics/ingest`; this API accepts local clients only and needs no token):
+  - `bac.health.status`: `0` ok, `1` degraded, `2` unhealthy.
+  - `bac.health.issue` with dimension `code`: `1` for each active code and `0` for each inactive one, so a problem closes when its code clears.
+- Each post has a short timeout and nothing waits for it. A failed post is logged and never affects booking logic. With `DYNATRACE_METRIC_INGEST_URL` empty (a laptop), the push is off.
 
-**Known limits of the first release.** The monitor cannot email when the SMTP relay is down, when the whole server is down, or when the monitor itself has stopped. These cases still fail closed (no booking is released), and the logs record them. Independent alarms for them are deferred.
+**Dynatrace configuration** (owned by the Dynatrace admin; no code):
+
+| Alert | Configuration | Covers |
+| :--- | :--- | :--- |
+| Health issue | Metric event on `bac.health.issue` split by `code`, value `1` for 3 of 5 minutes. The problem names the code. | Every code above. |
+| Health silent | Missing-data alert on `bac.health.status`. | Service down or hung, event loop blocked, OneAgent stopped, server down (including a graceful EC2 stop, which the built-in host availability check does not alert on by default). |
+| Process missing | Process availability rule on the service's command line, minimum 1 process. | Service unit stopped. |
+| Restarts | Built-in `PROCESS_RESTART` event kept critical. | Crashes and crash loops; every restart quarantines the meetings in progress. |
+| Server down | Built-in host availability. | Host or OneAgent connection lost. |
+
+- Problems reach the run team through their existing Dynatrace alerting profile and notification channel. Planned restarts (patch reboots and releases) run inside a Dynatrace maintenance window so they do not page anyone.
+- **Prerequisites:** OneAgent 1.243 or later on the instance in Infrastructure or Full-Stack mode (Foundation & Discovery mode cannot ingest custom metrics), with the Extension Execution Controller and the local HTTP metric ingest API enabled for the host. OneAgent needs outbound HTTPS to the Dynatrace tenant or the corporate ActiveGate (HLD §8.2).
+- `/healthz` stays the human view: runbooks, the release health check, and admins through the SSM tunnel.
+
+**Known limits of the first release.** The service reports on itself: a bug that reports `ok` while the service is broken is not caught, because only an outside probe would catch it, and that would mean exposing `/healthz` beyond `127.0.0.1`. The first alert arrives about 5 to 10 minutes after a failure.
 
 ---
 
