@@ -23,7 +23,8 @@ Thumbs.db
 *.swp
 *.swo
 
-# Dev
-.doc/
-.github/
-.scratch/
+# Local runtime state (laptop JsonFileFleetConfigStore)
+service/.local/
+
+# Claude Code personal settings
+.claude/settings.local.json
